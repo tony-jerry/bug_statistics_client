@@ -1,0 +1,34 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Build and packaging outputs
+build/
+build_*/
+dist/
+dist_*/
+*.exe
+
+# Local settings and credentials
+.env
+.env.*
+settings.json
+credentials.dat
+credentials.dat.tmp
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
