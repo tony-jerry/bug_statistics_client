@@ -6,6 +6,7 @@ import json
 import io
 import os
 import queue
+import sys
 import threading
 import webbrowser
 from datetime import datetime
@@ -41,9 +42,21 @@ from detail_utils import (
     rich_text_to_plain,
 )
 from retrospective import build_retrospective_markdown, retrospective_filename
+from workload_client import (
+    ALL_GROUP_MEMBERS,
+    DEFAULT_WORKLOAD_GROUP,
+    WorkloadApiClient,
+    WorkloadContext,
+    WorkloadPreview,
+    WorkloadSubmitResult,
+    build_workload_preview,
+    read_workload_excel,
+)
 
 
 APP_TITLE = "缺陷统计客户端"
+APP_VERSION = "v18.6"
+WINDOW_TITLE = f"{APP_TITLE}  {APP_VERSION}"
 APP_DIR = Path(__file__).resolve().parent
 SETTINGS_DIR = Path(os.environ.get("APPDATA", APP_DIR)) / "BugStatisticsClient"
 SETTINGS_PATH = SETTINGS_DIR / "settings.json"
@@ -66,6 +79,9 @@ DEFAULT_SETTINGS = {
     "username": "T0423",
     "plan_version": "2026-0730",
     "introducer": "",
+    "workload_group": DEFAULT_WORKLOAD_GROUP,
+    "workload_developer": ALL_GROUP_MEMBERS,
+    "workload_file": "",
 }
 CRM_TABLE_COLUMNS = CRM_SEARCH_COLUMNS
 
@@ -89,6 +105,19 @@ SUMMARY_COLUMNS = [
     ("severity_4", "4级", 70),
     ("closed", "已关闭", 80),
     ("open", "未关闭", 80),
+]
+
+WORKLOAD_COLUMNS = [
+    ("excel_row", "Excel 行", 72),
+    ("status", "状态", 82),
+    ("developer", "责任人", 90),
+    ("require_no", "需求编号", 135),
+    ("task_name", "工作描述", 360),
+    ("plan_start", "计划开始", 105),
+    ("plan_finish", "计划完成", 105),
+    ("requested_hours", "Excel 工时", 90),
+    ("computed_hours", "计算工时", 90),
+    ("message", "校验信息", 320),
 ]
 
 
@@ -434,7 +463,7 @@ class BugDetailDialog(tk.Toplevel):
 class BugStatisticsApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(APP_TITLE)
+        self.title(WINDOW_TITLE)
         self.geometry("1380x860")
         self.minsize(1100, 680)
         self.configure(background=COLOR_BG)
@@ -442,6 +471,7 @@ class BugStatisticsApp(tk.Tk):
         self.settings = self._load_settings()
         self.credentials = load_credentials(CREDENTIALS_PATH)
         self.client = BugApiClient(self.settings["base_url"])
+        self.workload_api = WorkloadApiClient(self.client)
         self.crm_client = CrmApiClient()
         self.all_bugs: list[dict[str, Any]] = []
         self.filtered_bugs: list[dict[str, Any]] = []
@@ -449,6 +479,10 @@ class BugStatisticsApp(tk.Tk):
         self.worker_messages: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.busy = False
         self.logged_in = False
+        self.plan_versions: list[PlanVersion] = []
+        self.workload_context: WorkloadContext | None = None
+        self.workload_preview: WorkloadPreview | None = None
+        self.performance_display_name = ""
 
         self._configure_style()
         self._build_ui()
@@ -473,6 +507,9 @@ class BugStatisticsApp(tk.Tk):
             "username": self.username_var.get().strip(),
             "plan_version": self.plan_var.get().strip(),
             "introducer": self.introducer_var.get().strip(),
+            "workload_group": self.workload_group_var.get().strip(),
+            "workload_developer": self.workload_developer_var.get().strip(),
+            "workload_file": self.workload_file_var.get().strip(),
         }
         try:
             SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -831,7 +868,7 @@ class BugStatisticsApp(tk.Tk):
         ).pack(side=tk.LEFT)
         ttk.Label(
             title_line,
-            text="绩效分析  /  CRM 检索  /  智能详情",
+            text="绩效分析  /  CRM 检索  /  批量录入",
             style="SubTitle.TLabel",
         ).pack(side=tk.LEFT, padx=(16, 0), pady=(8, 0))
         self.login_status_var = tk.StringVar(value="未登录")
@@ -1107,6 +1144,142 @@ class BugStatisticsApp(tk.Tk):
         introducer_entry.bind("<Return>", lambda _event: self._apply_filter())
         keyword_entry.bind("<Return>", lambda _event: self._apply_filter())
 
+    def _build_workload_controls(self, parent: ttk.Frame) -> None:
+        controls = ttk.LabelFrame(parent, text="绩效工作量批量录入", padding=10)
+        controls.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
+        controls.columnconfigure(9, weight=1)
+
+        self.workload_plan_var = tk.StringVar(value=self.settings["plan_version"])
+        self.workload_group_var = tk.StringVar(
+            value=self.settings.get("workload_group", DEFAULT_WORKLOAD_GROUP)
+        )
+        self.workload_developer_var = tk.StringVar(
+            value=self.settings.get("workload_developer", ALL_GROUP_MEMBERS)
+            or ALL_GROUP_MEMBERS
+        )
+        self.workload_file_var = tk.StringVar(
+            value=self.settings.get("workload_file", "")
+        )
+
+        ttk.Label(controls, text="计划版本", style="Card.TLabel").grid(
+            row=0, column=0, padx=(0, 6)
+        )
+        self.workload_plan_combo = ttk.Combobox(
+            controls,
+            textvariable=self.workload_plan_var,
+            width=15,
+            state="readonly",
+        )
+        self.workload_plan_combo.grid(row=0, column=1, padx=(0, 12))
+
+        ttk.Label(controls, text="录入分组", style="Card.TLabel").grid(
+            row=0, column=2, padx=(0, 6)
+        )
+        self.workload_group_combo = ttk.Combobox(
+            controls,
+            textvariable=self.workload_group_var,
+            width=17,
+            state="readonly",
+        )
+        self.workload_group_combo.grid(row=0, column=3, padx=(0, 12))
+        self.workload_group_combo.bind(
+            "<<ComboboxSelected>>", self._workload_group_changed
+        )
+
+        ttk.Label(controls, text="责任人筛选", style="Card.TLabel").grid(
+            row=0, column=4, padx=(0, 6)
+        )
+        self.workload_developer_combo = ttk.Combobox(
+            controls,
+            textvariable=self.workload_developer_var,
+            values=[ALL_GROUP_MEMBERS],
+            width=13,
+            state="readonly",
+        )
+        self.workload_developer_combo.grid(row=0, column=5, padx=(0, 12))
+        self.workload_developer_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._clear_workload_preview()
+        )
+
+        ttk.Label(controls, text="Excel", style="Card.TLabel").grid(
+            row=0, column=6, padx=(0, 6)
+        )
+        workload_file_entry = ttk.Entry(
+            controls,
+            textvariable=self.workload_file_var,
+            state="readonly",
+            width=38,
+        )
+        workload_file_entry.grid(row=0, column=7, sticky=tk.EW, padx=(0, 6))
+        controls.columnconfigure(7, weight=1)
+        self.workload_browse_button = ttk.Button(
+            controls,
+            text="选择文件",
+            command=self._choose_workload_file,
+            style="Secondary.TButton",
+        )
+        self.workload_browse_button.grid(row=0, column=8, padx=(0, 8))
+        self.workload_preview_button = ttk.Button(
+            controls,
+            text="加载并预览",
+            command=self._preview_workload,
+            style="Accent.TButton",
+        )
+        self.workload_preview_button.grid(row=0, column=9, sticky=tk.E)
+
+        ttk.Label(
+            controls,
+            text="只读取 .xlsx；选择“全部组员”时，仅导入当前分组成员的数据。提交前会再次确认。",
+            style="CardMuted.TLabel",
+        ).grid(row=1, column=0, columnspan=10, sticky=tk.W, pady=(8, 0))
+
+    def _build_workload_tab(self, parent: ttk.Frame) -> None:
+        self._build_workload_controls(parent)
+        preview_frame = ttk.Frame(parent)
+        preview_frame.grid(row=1, column=0, sticky=tk.NSEW)
+        parent.rowconfigure(1, weight=1)
+        parent.columnconfigure(0, weight=1)
+        self.workload_tree = self._make_tree(preview_frame, WORKLOAD_COLUMNS)
+        workload_text_columns = {"task_name", "message"}
+        for key, _label, _width in WORKLOAD_COLUMNS:
+            alignment = tk.W if key in workload_text_columns else tk.CENTER
+            self.workload_tree.heading(key, anchor=alignment)
+            self.workload_tree.column(
+                key,
+                anchor=alignment,
+                stretch=key == "message",
+            )
+        self.workload_tree.tag_configure("valid", background="#ECFDF5")
+        self.workload_tree.tag_configure("warning", background="#FFFBEB")
+        self.workload_tree.tag_configure("error", background="#FFF1F2")
+        self.workload_tree.tag_configure("duplicate", background="#F1F5F9")
+
+        footer = ttk.Frame(parent, style="Card.TFrame", padding=(8, 8))
+        footer.grid(row=2, column=0, sticky=tk.EW, pady=(8, 0))
+        self.workload_summary_var = tk.StringVar(
+            value="请选择 Excel，加载后先预览校验结果"
+        )
+        ttk.Label(
+            footer,
+            textvariable=self.workload_summary_var,
+            style="CardMuted.TLabel",
+        ).pack(side=tk.LEFT)
+        self.workload_clear_button = ttk.Button(
+            footer,
+            text="清空预览",
+            command=self._clear_workload_preview,
+            style="Secondary.TButton",
+        )
+        self.workload_clear_button.pack(side=tk.RIGHT, padx=(8, 0))
+        self.workload_submit_button = ttk.Button(
+            footer,
+            text="确认批量提交",
+            command=self._submit_workload,
+            state=tk.DISABLED,
+            style="Success.TButton",
+        )
+        self.workload_submit_button.pack(side=tk.RIGHT)
+
     @staticmethod
     def _toggle_password_visibility(
         entry: ttk.Entry,
@@ -1196,14 +1369,23 @@ class BugStatisticsApp(tk.Tk):
             style="NavInactive.TButton",
         )
         self.crm_nav_button.pack(side=tk.LEFT, padx=(4, 0))
+        self.workload_nav_button = ttk.Button(
+            nav_content,
+            text="▤  绩效录入",
+            command=lambda: self._select_main_tab("workload"),
+            style="NavInactive.TButton",
+        )
+        self.workload_nav_button.pack(side=tk.LEFT, padx=(4, 0))
 
         self.notebook = ttk.Notebook(parent, style="Content.TNotebook")
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
         self.performance_detail_tab = ttk.Frame(self.notebook, padding=6)
         self.crm_tab = ttk.Frame(self.notebook, padding=6)
+        self.workload_tab = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(self.performance_detail_tab, text="绩效缺陷明细")
         self.notebook.add(self.crm_tab, text="CRM 缺陷查询")
+        self.notebook.add(self.workload_tab, text="绩效录入")
 
         self._build_performance_controls(self.performance_detail_tab)
         self._build_metrics(self.performance_detail_tab)
@@ -1304,19 +1486,37 @@ class BugStatisticsApp(tk.Tk):
             "<Return>",
             lambda _event: self._query_crm_bugs(1),
         )
+        self._build_workload_tab(self.workload_tab)
         self._select_main_tab("performance")
 
     def _select_main_tab(self, tab_name: str) -> None:
-        is_performance = tab_name == "performance"
-        self.notebook.select(
-            self.performance_detail_tab if is_performance else self.crm_tab
-        )
+        tabs = {
+            "performance": self.performance_detail_tab,
+            "crm": self.crm_tab,
+            "workload": self.workload_tab,
+        }
+        selected = tab_name if tab_name in tabs else "performance"
+        self.notebook.select(tabs[selected])
         self.performance_nav_button.configure(
-            style="NavActive.TButton" if is_performance else "NavInactive.TButton"
+            style=(
+                "NavActive.TButton"
+                if selected == "performance"
+                else "NavInactive.TButton"
+            )
         )
         self.crm_nav_button.configure(
-            style="NavInactive.TButton" if is_performance else "NavActive.TButton"
+            style="NavActive.TButton" if selected == "crm" else "NavInactive.TButton"
         )
+        self.workload_nav_button.configure(
+            style=(
+                "NavActive.TButton"
+                if selected == "workload"
+                else "NavInactive.TButton"
+            )
+        )
+        if selected == "workload" and self.logged_in:
+            if not self.workload_group_combo.cget("values"):
+                self._load_workload_groups()
 
     def _make_tree(
         self,
@@ -1391,6 +1591,7 @@ class BugStatisticsApp(tk.Tk):
             self.logged_in = True
             self.login_status_label.configure(style="Connected.TLabel")
             performance_result, _crm_result = payload
+            self.performance_display_name = performance_result.display_name
             self.introducer_var.set(performance_result.display_name)
             self.login_status_var.set(
                 f"已登录：{performance_result.display_name}"
@@ -1416,6 +1617,54 @@ class BugStatisticsApp(tk.Tk):
             return
         if operation == "plans:success":
             self._apply_plan_versions(payload)
+            return
+        if operation == "workload_groups:success":
+            self._apply_workload_groups(payload)
+            return
+        if operation == "workload_developers:success":
+            developers = [ALL_GROUP_MEMBERS, *[item.name for item in payload]]
+            self.workload_developer_combo.configure(values=developers)
+            selected = self.workload_developer_var.get().strip()
+            self.workload_developer_var.set(
+                selected if selected in developers else ALL_GROUP_MEMBERS
+            )
+            self.status_var.set(
+                f"已加载 {len(developers) - 1} 名当前分组前端成员"
+            )
+            self._save_settings()
+            return
+        if operation == "workload_preview:success":
+            context, preview = payload
+            self.workload_context = context
+            self.workload_preview = preview
+            developers = [ALL_GROUP_MEMBERS, *sorted(context.developers)]
+            self.workload_developer_combo.configure(values=developers)
+            if self.workload_developer_var.get() not in developers:
+                self.workload_developer_var.set(ALL_GROUP_MEMBERS)
+            self._render_workload_preview()
+            self._save_settings()
+            return
+        if operation == "workload_submit:success":
+            result: WorkloadSubmitResult = payload
+            self.workload_context = None
+            self.workload_preview = None
+            self.workload_submit_button.configure(state=tk.DISABLED)
+            self.status_var.set(
+                f"绩效录入完成：提交 {result.submitted_count} 条，"
+                f"回查确认 {result.verified_count} 条"
+            )
+            self.workload_summary_var.set(
+                f"保存前 {result.before_count} 条，保存后 {result.after_count} 条；"
+                "如需再次导入，请重新加载预览"
+            )
+            messagebox.showinfo(
+                APP_TITLE,
+                f"{result.message}\n\n"
+                f"提交：{result.submitted_count} 条\n"
+                f"回查确认：{result.verified_count} 条\n"
+                f"分组记录数：{result.before_count} → {result.after_count}",
+                parent=self,
+            )
             return
         if operation == "query:success":
             self.all_bugs = payload
@@ -1484,6 +1733,10 @@ class BugStatisticsApp(tk.Tk):
             self.crm_search_button,
             self.crm_previous_button,
             self.crm_next_button,
+            self.workload_browse_button,
+            self.workload_preview_button,
+            self.workload_clear_button,
+            self.workload_submit_button,
         ]:
             button.configure(state=state)
         if busy:
@@ -1493,6 +1746,15 @@ class BugStatisticsApp(tk.Tk):
             self.progress.stop()
             self._hide_loading()
             self._update_crm_paging_buttons()
+            self.workload_submit_button.configure(
+                state=(
+                    tk.NORMAL
+                    if self.workload_context
+                    and self.workload_preview
+                    and self.workload_preview.submittable_rows
+                    else tk.DISABLED
+                )
+            )
 
     def _login(self) -> None:
         username = self.username_var.get()
@@ -1527,8 +1789,10 @@ class BugStatisticsApp(tk.Tk):
         )
 
     def _apply_plan_versions(self, plans: list[PlanVersion]) -> None:
+        self.plan_versions = plans
         values = [plan.plan_version for plan in plans]
         self.plan_combo.configure(values=values)
+        self.workload_plan_combo.configure(values=values)
         if not plans:
             self.status_var.set("当前年份没有可选的计划版本")
             return
@@ -1545,11 +1809,199 @@ class BugStatisticsApp(tk.Tk):
             saved = self.settings.get("plan_version", "")
             selected = saved if saved in values else values[0]
         self.plan_var.set(selected)
+        saved_workload_plan = self.workload_plan_var.get().strip()
+        self.workload_plan_var.set(
+            saved_workload_plan if saved_workload_plan in values else selected
+        )
         self.status_var.set(
             f"已加载 {now.year} 年 {len(plans)} 个计划版本，"
             f"当前选择 {selected}"
         )
         self._save_settings()
+
+    def _load_workload_groups(self) -> None:
+        if not self.logged_in:
+            return
+        self.status_var.set("正在读取可录入的绩效分组…")
+        self._run_worker("workload_groups", self.workload_api.get_groups)
+
+    def _apply_workload_groups(self, groups: list[Any]) -> None:
+        values = [group.name for group in groups]
+        self.workload_group_combo.configure(values=values)
+        if not values:
+            self.workload_group_var.set("")
+            self.status_var.set("没有读取到可录入的开发分组")
+            return
+        saved = self.workload_group_var.get().strip()
+        selected = (
+            saved
+            if saved in values
+            else DEFAULT_WORKLOAD_GROUP
+            if DEFAULT_WORKLOAD_GROUP in values
+            else values[0]
+        )
+        self.workload_group_var.set(selected)
+        self.status_var.set(f"已加载 {len(values)} 个绩效录入分组")
+        self._save_settings()
+        self._load_workload_developers()
+
+    def _load_workload_developers(self) -> None:
+        if not self.logged_in:
+            return
+        module = self.workload_group_var.get().strip()
+        if not module:
+            return
+        self.status_var.set(f"正在读取 {module} 的开发资源…")
+        self._run_worker(
+            "workload_developers",
+            lambda: self.workload_api.get_developers(module),
+        )
+
+    def _choose_workload_file(self) -> None:
+        initial_path = self.workload_file_var.get().strip()
+        initial_directory = (
+            str(Path(initial_path).parent)
+            if initial_path and Path(initial_path).parent.exists()
+            else str(APP_DIR.parent)
+        )
+        selected = filedialog.askopenfilename(
+            parent=self,
+            title="选择工作量 Excel",
+            initialdir=initial_directory,
+            filetypes=[("Excel 工作簿", "*.xlsx")],
+        )
+        if not selected:
+            return
+        self.workload_file_var.set(selected)
+        self._clear_workload_preview()
+        self.status_var.set(f"已选择 Excel：{Path(selected).name}")
+        self._save_settings()
+
+    def _clear_workload_preview(self) -> None:
+        self.workload_context = None
+        self.workload_preview = None
+        if hasattr(self, "workload_tree"):
+            self.workload_tree.delete(*self.workload_tree.get_children())
+        if hasattr(self, "workload_summary_var"):
+            self.workload_summary_var.set("请选择 Excel，加载后先预览校验结果")
+        if hasattr(self, "workload_submit_button"):
+            self.workload_submit_button.configure(state=tk.DISABLED)
+
+    def _workload_group_changed(self, _event: tk.Event | None = None) -> None:
+        self.workload_developer_var.set(ALL_GROUP_MEMBERS)
+        self.workload_developer_combo.configure(values=[ALL_GROUP_MEMBERS])
+        self._clear_workload_preview()
+        self._save_settings()
+        self._load_workload_developers()
+
+    def _preview_workload(self) -> None:
+        if not self.logged_in:
+            messagebox.showinfo(APP_TITLE, "请先登录", parent=self)
+            return
+        plan_version = self.workload_plan_var.get().strip()
+        module = self.workload_group_var.get().strip()
+        excel_path = self.workload_file_var.get().strip()
+        developer_filter = self.workload_developer_var.get().strip() or ALL_GROUP_MEMBERS
+        if not plan_version:
+            messagebox.showinfo(APP_TITLE, "请选择计划版本", parent=self)
+            return
+        if not module:
+            messagebox.showinfo(APP_TITLE, "请选择录入分组", parent=self)
+            return
+        if not excel_path:
+            messagebox.showinfo(APP_TITLE, "请先选择 Excel 文件", parent=self)
+            return
+
+        self._clear_workload_preview()
+        self.status_var.set(
+            f"正在校验 {Path(excel_path).name}，目标 {plan_version} / {module}…"
+        )
+
+        def build_preview() -> tuple[WorkloadContext, WorkloadPreview]:
+            context = self.workload_api.get_context(plan_version, module)
+            items = read_workload_excel(excel_path, plan_version)
+            preview = build_workload_preview(items, context, developer_filter)
+            return context, preview
+
+        self._run_worker("workload_preview", build_preview)
+
+    def _render_workload_preview(self) -> None:
+        self.workload_tree.delete(*self.workload_tree.get_children())
+        preview = self.workload_preview
+        if preview is None:
+            return
+        tag_by_status = {
+            "可提交": "valid",
+            "提醒": "warning",
+            "错误": "error",
+            "已存在": "duplicate",
+        }
+        for row in preview.rows:
+            source = row.source
+            self.workload_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    source.excel_row,
+                    row.status,
+                    source.developer_name,
+                    source.require_no,
+                    source.task_name,
+                    source.plan_start_date,
+                    source.plan_finish_date,
+                    f"{source.requested_days * 8:g}",
+                    f"{row.computed_hours:g}",
+                    row.message,
+                ),
+                tags=(tag_by_status.get(row.status, ""),),
+            )
+        ignored_hint = (
+            "；非本组责任人：" + "、".join(preview.ignored_developers)
+            if preview.ignored_developers
+            else ""
+        )
+        self.workload_summary_var.set(
+            f"Excel 有效数据 {preview.source_row_count} 行，匹配 {len(preview.rows)} 行，"
+            f"可提交 {len(preview.submittable_rows)} 行（提醒 {preview.warning_count}），"
+            f"错误 {preview.error_count} 行，已存在 {preview.duplicate_count} 行，"
+            f"跳过 {preview.skipped_row_count} 行；"
+            f"Excel {preview.requested_hours:g}h / 计算 {preview.computed_hours:g}h"
+            f"{ignored_hint}"
+        )
+        self.status_var.set(
+            f"预览完成：{len(preview.submittable_rows)} 条可以提交，"
+            f"{preview.error_count} 条需要修正"
+        )
+        self.workload_submit_button.configure(
+            state=tk.NORMAL if preview.submittable_rows else tk.DISABLED
+        )
+
+    def _submit_workload(self) -> None:
+        context = self.workload_context
+        preview = self.workload_preview
+        if context is None or preview is None or not preview.submittable_rows:
+            messagebox.showinfo(APP_TITLE, "请先加载并检查导入预览", parent=self)
+            return
+        count = len(preview.submittable_rows)
+        confirmed = messagebox.askyesno(
+            APP_TITLE,
+            "即将向绩效系统写入工作量：\n\n"
+            f"计划版本：{context.plan_version}\n"
+            f"录入分组：{context.module}\n"
+            f"新增记录：{count} 条\n"
+            f"计算工时：{preview.computed_hours:g} 小时\n\n"
+            "系统会一次批量保存，并在保存后自动回查。确认提交吗？",
+            icon="warning",
+            parent=self,
+        )
+        if not confirmed:
+            return
+        rows = list(preview.submittable_rows)
+        self.status_var.set(f"正在批量保存 {count} 条绩效工作量…")
+        self._run_worker(
+            "workload_submit",
+            lambda: self.workload_api.submit(context, rows),
+        )
 
     def _query_crm_bugs(
         self,
@@ -2153,5 +2605,20 @@ class BugStatisticsApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = BugStatisticsApp()
-    app.mainloop()
+    if len(sys.argv) >= 4 and sys.argv[1] == "--diagnose-workload-excel":
+        diagnostic_output = Path(sys.argv[3])
+        try:
+            diagnostic_items = read_workload_excel(sys.argv[2], "2026-0830")
+            diagnostic_result = {
+                "success": True,
+                "rowCount": len(diagnostic_items),
+            }
+        except Exception as exc:
+            diagnostic_result = {"success": False, "message": str(exc)}
+        diagnostic_output.write_text(
+            json.dumps(diagnostic_result, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    else:
+        app = BugStatisticsApp()
+        app.mainloop()
