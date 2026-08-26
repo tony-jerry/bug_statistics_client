@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import calendar
 import json
 import io
 import os
 import queue
+import shutil
 import sys
 import threading
 import webbrowser
-from datetime import datetime
+from dataclasses import replace
+from datetime import date, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any, Callable
 
@@ -45,35 +49,40 @@ from retrospective import build_retrospective_markdown, retrospective_filename
 from workload_client import (
     ALL_GROUP_MEMBERS,
     DEFAULT_WORKLOAD_GROUP,
+    ExcelWorkItem,
     WorkloadApiClient,
     WorkloadContext,
     WorkloadPreview,
     WorkloadSubmitResult,
+    _read_open_office_xlsx_bytes,
     build_workload_preview,
+    office_snapshot_diagnostics,
     read_workload_excel,
 )
 
 
 APP_TITLE = "缺陷统计客户端"
-APP_VERSION = "v18.6"
+APP_VERSION = "v18.23"
 WINDOW_TITLE = f"{APP_TITLE}  {APP_VERSION}"
+WORKLOAD_ALLOWED_USERS = frozenset({"T0423", "T0101"})
 APP_DIR = Path(__file__).resolve().parent
+WORKLOAD_TEMPLATE_RELATIVE_PATH = Path("assets") / "workload_import_template.xlsx"
 SETTINGS_DIR = Path(os.environ.get("APPDATA", APP_DIR)) / "BugStatisticsClient"
 SETTINGS_PATH = SETTINGS_DIR / "settings.json"
 CREDENTIALS_PATH = SETTINGS_DIR / "credentials.dat"
-COLOR_BG = "#F3F6FB"
-COLOR_SURFACE = "#FFFFFF"
-COLOR_SURFACE_ALT = "#F7F9FC"
-COLOR_SURFACE_RAISED = "#EDF2F8"
-COLOR_BORDER = "#D7E0EB"
-COLOR_TEXT = "#172033"
-COLOR_MUTED = "#65748B"
-COLOR_ACCENT = "#1677FF"
-COLOR_ACCENT_HOVER = "#3B8CFF"
-COLOR_CYAN = "#0EA5E9"
-COLOR_SUCCESS = "#10B981"
-COLOR_WARNING = "#F59E0B"
-COLOR_DANGER = "#F43F5E"
+COLOR_BG = "#070B17"
+COLOR_SURFACE = "#0F172A"
+COLOR_SURFACE_ALT = "#121C31"
+COLOR_SURFACE_RAISED = "#19243B"
+COLOR_BORDER = "#2A3858"
+COLOR_TEXT = "#E8EEF9"
+COLOR_MUTED = "#8FA1BC"
+COLOR_ACCENT = "#5B7CFF"
+COLOR_ACCENT_HOVER = "#7390FF"
+COLOR_CYAN = "#28D7F4"
+COLOR_SUCCESS = "#34D399"
+COLOR_WARNING = "#FBBF24"
+COLOR_DANGER = "#FB7185"
 DEFAULT_SETTINGS = {
     "base_url": DEFAULT_BASE_URL,
     "username": "T0423",
@@ -84,6 +93,28 @@ DEFAULT_SETTINGS = {
     "workload_file": "",
 }
 CRM_TABLE_COLUMNS = CRM_SEARCH_COLUMNS
+
+
+def has_workload_access(staff_number: str) -> bool:
+    return str(staff_number or "").strip().upper() in WORKLOAD_ALLOWED_USERS
+
+
+def bundled_resource_path(relative_path: str | Path) -> Path:
+    """返回源码或 PyInstaller 单文件包中的资源路径。"""
+
+    bundle_root = Path(getattr(sys, "_MEIPASS", APP_DIR))
+    return bundle_root / Path(relative_path)
+
+
+def copy_workload_template(destination: str | Path) -> Path:
+    """把内置绩效录入模板复制到用户选择的位置。"""
+
+    source = bundled_resource_path(WORKLOAD_TEMPLATE_RELATIVE_PATH)
+    if not source.is_file():
+        raise FileNotFoundError(f"内置模板不存在：{source}")
+    target = Path(destination)
+    shutil.copyfile(source, target)
+    return target
 
 DETAIL_COLUMNS = [
     ("id", "缺陷编号", 165),
@@ -108,6 +139,7 @@ SUMMARY_COLUMNS = [
 ]
 
 WORKLOAD_COLUMNS = [
+    ("selected", "选择", 58),
     ("excel_row", "Excel 行", 72),
     ("status", "状态", 82),
     ("developer", "责任人", 90),
@@ -115,10 +147,439 @@ WORKLOAD_COLUMNS = [
     ("task_name", "工作描述", 360),
     ("plan_start", "计划开始", 105),
     ("plan_finish", "计划完成", 105),
-    ("requested_hours", "Excel 工时", 90),
-    ("computed_hours", "计算工时", 90),
+    ("requested_hours", "Excel 工时（小时）", 112),
+    ("computed_hours", "计算工时（小时）", 112),
     ("message", "校验信息", 320),
+    ("action", "操作", 72),
 ]
+
+WORKLOAD_EDITABLE_COLUMNS = {
+    "developer": "责任人",
+    "require_no": "需求编号",
+    "task_name": "工作描述",
+    "plan_start": "计划开始",
+    "plan_finish": "计划完成",
+    "requested_hours": "Excel 工时",
+}
+
+
+class DatePickerPopup(tk.Toplevel):
+    """轻量日期选择器，避免为桌面客户端额外引入第三方依赖。"""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        initial_value: str,
+        on_select: Callable[[str], None],
+        anchor_x: int,
+        anchor_y: int,
+    ) -> None:
+        super().__init__(parent)
+        try:
+            selected_date = date.fromisoformat(initial_value)
+        except ValueError:
+            selected_date = date.today()
+        self.selected_date = selected_date
+        self.display_year = selected_date.year
+        self.display_month = selected_date.month
+        self.on_select = on_select
+        self.title("选择日期")
+        self.resizable(False, False)
+        self.transient(parent.winfo_toplevel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda _event: self._cancel())
+
+        self.configure(background=COLOR_SURFACE)
+        self.content = ttk.Frame(self, style="Card.TFrame", padding=8)
+        self.content.pack(fill=tk.BOTH, expand=True)
+        header = ttk.Frame(self.content, style="Card.TFrame")
+        header.grid(row=0, column=0, columnspan=7, sticky=tk.EW, pady=(0, 6))
+        ttk.Button(
+            header,
+            text="‹",
+            width=3,
+            command=lambda: self._change_month(-1),
+            style="Secondary.TButton",
+        ).pack(side=tk.LEFT)
+        self.month_var = tk.StringVar()
+        ttk.Label(
+            header,
+            textvariable=self.month_var,
+            anchor=tk.CENTER,
+            style="Card.TLabel",
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        ttk.Button(
+            header,
+            text="›",
+            width=3,
+            command=lambda: self._change_month(1),
+            style="Secondary.TButton",
+        ).pack(side=tk.RIGHT)
+
+        for column, weekday in enumerate(("一", "二", "三", "四", "五", "六", "日")):
+            ttk.Label(
+                self.content,
+                text=weekday,
+                width=4,
+                anchor=tk.CENTER,
+                style="CardMuted.TLabel",
+            ).grid(row=1, column=column, padx=1, pady=(0, 2))
+
+        self.days_frame = ttk.Frame(self.content, style="Card.TFrame")
+        self.days_frame.grid(row=2, column=0, columnspan=7)
+        footer = ttk.Frame(self.content, style="Card.TFrame")
+        footer.grid(row=3, column=0, columnspan=7, sticky=tk.EW, pady=(7, 0))
+        ttk.Button(
+            footer,
+            text="今天",
+            command=self._select_today,
+            style="Secondary.TButton",
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            footer,
+            text="取消",
+            command=self._cancel,
+            style="Secondary.TButton",
+        ).pack(side=tk.RIGHT)
+
+        self._render_month()
+        self.update_idletasks()
+        popup_width = self.winfo_reqwidth()
+        popup_height = self.winfo_reqheight()
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = max(0, min(anchor_x, screen_width - popup_width))
+        y = max(0, min(anchor_y, screen_height - popup_height))
+        self.geometry(f"+{x}+{y}")
+        self.grab_set()
+        self.focus_force()
+
+    def _render_month(self) -> None:
+        self.month_var.set(f"{self.display_year} 年 {self.display_month} 月")
+        for child in self.days_frame.winfo_children():
+            child.destroy()
+        weeks = calendar.Calendar(firstweekday=calendar.MONDAY).monthdayscalendar(
+            self.display_year,
+            self.display_month,
+        )
+        for row, week in enumerate(weeks):
+            for column, day_number in enumerate(week):
+                if day_number == 0:
+                    ttk.Label(
+                        self.days_frame,
+                        text="",
+                        width=4,
+                        style="Card.TLabel",
+                    ).grid(
+                        row=row,
+                        column=column,
+                        padx=1,
+                        pady=1,
+                    )
+                    continue
+                is_selected = (
+                    self.display_year == self.selected_date.year
+                    and self.display_month == self.selected_date.month
+                    and day_number == self.selected_date.day
+                )
+                ttk.Button(
+                    self.days_frame,
+                    text=str(day_number),
+                    width=3,
+                    command=lambda day=day_number: self._select_day(day),
+                    style="Accent.TButton" if is_selected else "Secondary.TButton",
+                ).grid(row=row, column=column, padx=1, pady=1)
+
+    def _change_month(self, offset: int) -> None:
+        month_index = self.display_year * 12 + self.display_month - 1 + offset
+        self.display_year, zero_based_month = divmod(month_index, 12)
+        self.display_month = zero_based_month + 1
+        self._render_month()
+
+    def _select_today(self) -> None:
+        today = date.today()
+        callback = self.on_select
+        self.destroy()
+        callback(today.isoformat())
+
+    def _select_day(self, day_number: int) -> None:
+        selected = date(
+            self.display_year,
+            self.display_month,
+            day_number,
+        )
+        callback = self.on_select
+        self.destroy()
+        callback(selected.isoformat())
+
+    def _cancel(self) -> None:
+        self.destroy()
+
+
+class WorkloadAddDialog(tk.Toplevel):
+    """通过受控表单新增一条工作量记录。"""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        context: WorkloadContext,
+        excel_row: int,
+        on_add: Callable[[ExcelWorkItem], None],
+    ) -> None:
+        super().__init__(parent)
+        self.context = context
+        self.excel_row = excel_row
+        self.on_add = on_add
+        self.date_picker: DatePickerPopup | None = None
+        self.title("添加工作量")
+        self.resizable(False, False)
+        self.transient(parent.winfo_toplevel())
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        self.requirement_var = tk.StringVar()
+        self.developer_var = tk.StringVar()
+        self.task_name_var = tk.StringVar()
+        self.plan_start_var = tk.StringVar()
+        self.plan_finish_var = tk.StringVar()
+        self.hours_var = tk.StringVar()
+
+        self.requirement_labels = {
+            f"{requirement_no} | {description}": requirement_no
+            for requirement_no, description in sorted(context.requirements.items())
+        }
+        requirement_values = list(self.requirement_labels)
+        developer_values = sorted(context.developers)
+
+        ttk.Label(body, text="需求编号", style="Card.TLabel").grid(
+            row=0,
+            column=0,
+            sticky=tk.W,
+            pady=5,
+        )
+        requirement_combo = ttk.Combobox(
+            body,
+            textvariable=self.requirement_var,
+            values=requirement_values,
+            state="readonly",
+            width=58,
+        )
+        requirement_combo.grid(
+            row=0,
+            column=1,
+            columnspan=3,
+            sticky=tk.EW,
+            pady=5,
+        )
+
+        ttk.Label(body, text="责任人", style="Card.TLabel").grid(
+            row=1,
+            column=0,
+            sticky=tk.W,
+            pady=5,
+        )
+        developer_combo = ttk.Combobox(
+            body,
+            textvariable=self.developer_var,
+            values=developer_values,
+            state="readonly",
+            width=22,
+        )
+        developer_combo.grid(row=1, column=1, sticky=tk.W, pady=5)
+
+        ttk.Label(body, text="Excel 工时", style="Card.TLabel").grid(
+            row=1,
+            column=2,
+            sticky=tk.E,
+            padx=(18, 6),
+            pady=5,
+        )
+        ttk.Entry(
+            body,
+            textvariable=self.hours_var,
+            width=16,
+        ).grid(row=1, column=3, sticky=tk.EW, pady=5)
+
+        ttk.Label(body, text="工作描述", style="Card.TLabel").grid(
+            row=2,
+            column=0,
+            sticky=tk.W,
+            pady=5,
+        )
+        ttk.Entry(
+            body,
+            textvariable=self.task_name_var,
+        ).grid(
+            row=2,
+            column=1,
+            columnspan=3,
+            sticky=tk.EW,
+            pady=5,
+        )
+
+        ttk.Label(body, text="计划开始", style="Card.TLabel").grid(
+            row=3,
+            column=0,
+            sticky=tk.W,
+            pady=5,
+        )
+        ttk.Entry(
+            body,
+            textvariable=self.plan_start_var,
+            state="readonly",
+            width=18,
+        ).grid(row=3, column=1, sticky=tk.EW, pady=5)
+        start_button = ttk.Button(
+            body,
+            text="选择日期",
+            style="Secondary.TButton",
+        )
+        start_button.configure(
+            command=lambda: self._choose_date(self.plan_start_var, start_button)
+        )
+        start_button.grid(row=3, column=2, sticky=tk.W, padx=(8, 0), pady=5)
+
+        ttk.Label(body, text="计划完成", style="Card.TLabel").grid(
+            row=4,
+            column=0,
+            sticky=tk.W,
+            pady=5,
+        )
+        ttk.Entry(
+            body,
+            textvariable=self.plan_finish_var,
+            state="readonly",
+            width=18,
+        ).grid(row=4, column=1, sticky=tk.EW, pady=5)
+        finish_button = ttk.Button(
+            body,
+            text="选择日期",
+            style="Secondary.TButton",
+        )
+        finish_button.configure(
+            command=lambda: self._choose_date(self.plan_finish_var, finish_button)
+        )
+        finish_button.grid(row=4, column=2, sticky=tk.W, padx=(8, 0), pady=5)
+
+        actions = ttk.Frame(body)
+        actions.grid(row=5, column=0, columnspan=4, sticky=tk.E, pady=(14, 0))
+        ttk.Button(
+            actions,
+            text="取消",
+            command=self._close,
+            style="Secondary.TButton",
+        ).pack(side=tk.RIGHT)
+        ttk.Button(
+            actions,
+            text="确定添加",
+            command=self._submit,
+            style="Accent.TButton",
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        body.columnconfigure(1, weight=1)
+        body.columnconfigure(3, weight=1)
+        if requirement_values:
+            requirement_combo.current(0)
+        if developer_values:
+            developer_combo.current(0)
+        self.bind("<Escape>", lambda _event: self._close())
+        self.bind("<Return>", lambda _event: self._submit())
+        self.update_idletasks()
+        parent_window = parent.winfo_toplevel()
+        x = parent_window.winfo_rootx() + max(
+            0,
+            (parent_window.winfo_width() - self.winfo_reqwidth()) // 2,
+        )
+        y = parent_window.winfo_rooty() + max(
+            0,
+            (parent_window.winfo_height() - self.winfo_reqheight()) // 2,
+        )
+        self.geometry(f"+{x}+{y}")
+        self.grab_set()
+        requirement_combo.focus_set()
+
+    def _choose_date(
+        self,
+        variable: tk.StringVar,
+        anchor: ttk.Button,
+    ) -> None:
+        if self.date_picker is not None and self.date_picker.winfo_exists():
+            self.date_picker.destroy()
+
+        def apply_date(value: str) -> None:
+            self.date_picker = None
+            variable.set(value)
+
+        self.date_picker = DatePickerPopup(
+            self,
+            variable.get(),
+            apply_date,
+            anchor.winfo_rootx(),
+            anchor.winfo_rooty() + anchor.winfo_height(),
+        )
+
+    def _submit(self) -> None:
+        requirement_no = self.requirement_labels.get(self.requirement_var.get(), "")
+        developer_name = self.developer_var.get().strip()
+        task_name = self.task_name_var.get().strip()
+        start_date = self.plan_start_var.get().strip()
+        finish_date = self.plan_finish_var.get().strip()
+        try:
+            requested_hours = float(self.hours_var.get().strip())
+            if not isfinite(requested_hours) or requested_hours <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                APP_TITLE,
+                "Excel 工时请输入大于 0 的数字，例如 19.2",
+                parent=self,
+            )
+            return
+        if not requirement_no:
+            messagebox.showerror(APP_TITLE, "请选择需求编号", parent=self)
+            return
+        if not developer_name:
+            messagebox.showerror(APP_TITLE, "请选择责任人", parent=self)
+            return
+        if not task_name:
+            messagebox.showerror(APP_TITLE, "请输入工作描述", parent=self)
+            return
+        try:
+            parsed_start = date.fromisoformat(start_date)
+            parsed_finish = date.fromisoformat(finish_date)
+        except ValueError:
+            messagebox.showerror(
+                APP_TITLE,
+                "请选择计划开始和计划完成日期",
+                parent=self,
+            )
+            return
+        if parsed_start > parsed_finish:
+            messagebox.showerror(
+                APP_TITLE,
+                "计划开始日期不能晚于计划完成日期",
+                parent=self,
+            )
+            return
+        item = ExcelWorkItem(
+            excel_row=self.excel_row,
+            require_no=requirement_no,
+            task_name=task_name,
+            plan_start_date=start_date,
+            plan_finish_date=finish_date,
+            requested_days=requested_hours / 8,
+            developer_name=developer_name,
+        )
+        callback = self.on_add
+        self._close()
+        callback(item)
+
+    def _close(self) -> None:
+        if self.date_picker is not None and self.date_picker.winfo_exists():
+            self.date_picker.destroy()
+        self.destroy()
 
 
 class ImagePreviewDialog(tk.Toplevel):
@@ -348,7 +809,7 @@ class BugDetailDialog(tk.Toplevel):
         text_widget.tag_configure(
             "field_label",
             font=("Microsoft YaHei UI", 10, "bold"),
-            foreground="#40536B",
+            foreground="#B8C7DD",
         )
         text_widget.insert(tk.END, "全部表单字段\n", "section_heading")
         for field in self.regular_fields:
@@ -477,17 +938,29 @@ class BugStatisticsApp(tk.Tk):
         self.filtered_bugs: list[dict[str, Any]] = []
         self.crm_bug_page: CrmBugPage | None = None
         self.worker_messages: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._worker_poll_after_id: str | None = None
         self.busy = False
         self.logged_in = False
         self.plan_versions: list[PlanVersion] = []
         self.workload_context: WorkloadContext | None = None
         self.workload_preview: WorkloadPreview | None = None
+        self.workload_items: list[ExcelWorkItem] = []
+        self.workload_added_rows: set[int] = set()
+        self.workload_selected_rows: set[int] = set()
+        self.workload_editor: tk.Widget | None = None
+        self.workload_date_picker: DatePickerPopup | None = None
+        self.workload_add_dialog: WorkloadAddDialog | None = None
+        self.workload_row_widgets: dict[
+            str,
+            tuple[tk.Button, tk.Label, tk.Button],
+        ] = {}
         self.performance_display_name = ""
+        self.performance_staff_number = ""
 
         self._configure_style()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(100, self._poll_worker_messages)
+        self._worker_poll_after_id = self.after(100, self._poll_worker_messages)
 
     def _load_settings(self) -> dict[str, str]:
         settings = dict(DEFAULT_SETTINGS)
@@ -533,7 +1006,7 @@ class BugStatisticsApp(tk.Tk):
             font=default_font,
         )
         style.configure("TFrame", background=COLOR_BG)
-        style.configure("Header.TFrame", background=COLOR_BG)
+        style.configure("Header.TFrame", background=COLOR_SURFACE)
         style.configure("Card.TFrame", background=COLOR_SURFACE)
         style.configure(
             "StatusBar.TFrame",
@@ -548,19 +1021,19 @@ class BugStatisticsApp(tk.Tk):
         )
         style.configure(
             "Title.TLabel",
-            background=COLOR_BG,
+            background=COLOR_SURFACE,
             foreground=COLOR_TEXT,
-            font=("Microsoft YaHei UI", 20, "bold"),
+            font=("Microsoft YaHei UI", 21, "bold"),
         )
         style.configure(
             "SubTitle.TLabel",
-            background=COLOR_BG,
+            background=COLOR_SURFACE,
             foreground=COLOR_MUTED,
             font=("Microsoft YaHei UI", 10),
         )
         style.configure(
             "Eyebrow.TLabel",
-            background=COLOR_BG,
+            background=COLOR_SURFACE,
             foreground=COLOR_CYAN,
             font=("Microsoft YaHei UI", 8, "bold"),
         )
@@ -581,15 +1054,15 @@ class BugStatisticsApp(tk.Tk):
         )
         style.configure(
             "LoginStatus.TLabel",
-            background="#FFF7E6",
-            foreground="#B86A00",
+            background="#2D2517",
+            foreground="#FBBF24",
             padding=(12, 7),
             font=("Microsoft YaHei UI", 9, "bold"),
         )
         style.configure(
             "Connected.TLabel",
-            background="#E8FBF3",
-            foreground="#078B68",
+            background="#123129",
+            foreground="#5EE7B7",
             padding=(12, 7),
             font=("Microsoft YaHei UI", 9, "bold"),
         )
@@ -606,7 +1079,7 @@ class BugStatisticsApp(tk.Tk):
             lightcolor=COLOR_BORDER,
             darkcolor=COLOR_BORDER,
             borderwidth=1,
-            relief=tk.SOLID,
+            relief=tk.FLAT,
         )
         style.configure(
             "TLabelframe.Label",
@@ -631,7 +1104,8 @@ class BugStatisticsApp(tk.Tk):
             bordercolor=[("focus", COLOR_CYAN)],
             lightcolor=[("focus", COLOR_CYAN)],
             darkcolor=[("focus", COLOR_CYAN)],
-            fieldbackground=[("disabled", COLOR_SURFACE)],
+            fieldbackground=[("disabled", "#101827")],
+            foreground=[("disabled", "#64748B")],
         )
         style.configure(
             "TCombobox",
@@ -655,6 +1129,42 @@ class BugStatisticsApp(tk.Tk):
             selectforeground=[("readonly", COLOR_TEXT)],
             bordercolor=[("focus", COLOR_CYAN)],
         )
+        style.configure(
+            "WorkloadEditor.TEntry",
+            fieldbackground="#17233B",
+            foreground=COLOR_TEXT,
+            insertcolor=COLOR_TEXT,
+            bordercolor=COLOR_CYAN,
+            lightcolor=COLOR_CYAN,
+            darkcolor=COLOR_CYAN,
+            padding=(7, 4),
+            relief=tk.SOLID,
+        )
+        style.map(
+            "WorkloadEditor.TEntry",
+            bordercolor=[("focus", COLOR_CYAN)],
+            lightcolor=[("focus", COLOR_CYAN)],
+            darkcolor=[("focus", COLOR_CYAN)],
+        )
+        style.configure(
+            "WorkloadEditor.TCombobox",
+            fieldbackground="#17233B",
+            background="#17233B",
+            foreground=COLOR_TEXT,
+            arrowcolor=COLOR_CYAN,
+            bordercolor=COLOR_CYAN,
+            lightcolor=COLOR_CYAN,
+            darkcolor=COLOR_CYAN,
+            padding=(7, 3),
+        )
+        style.map(
+            "WorkloadEditor.TCombobox",
+            fieldbackground=[("readonly", "#17233B"), ("focus", "#17233B")],
+            foreground=[("readonly", COLOR_TEXT)],
+            selectbackground=[("readonly", "#17233B")],
+            selectforeground=[("readonly", COLOR_TEXT)],
+            bordercolor=[("focus", COLOR_CYAN)],
+        )
 
         style.configure(
             "TButton",
@@ -669,11 +1179,11 @@ class BugStatisticsApp(tk.Tk):
         style.map(
             "TButton",
             background=[
-                ("pressed", "#D4E5FA"),
-                ("active", "#E1ECFA"),
-                ("disabled", "#E9EEF5"),
+                ("pressed", "#263755"),
+                ("active", "#22314E"),
+                ("disabled", "#111A2B"),
             ],
-            foreground=[("disabled", "#98A5B5")],
+            foreground=[("disabled", "#596A84")],
         )
         style.configure(
             "Accent.TButton",
@@ -683,29 +1193,49 @@ class BugStatisticsApp(tk.Tk):
         style.map(
             "Accent.TButton",
             background=[
-                ("pressed", "#1766D7"),
+                ("pressed", "#4562D9"),
                 ("active", COLOR_ACCENT_HOVER),
-                ("disabled", "#A9C9F5"),
+                ("disabled", "#334366"),
             ],
-            foreground=[("disabled", "#F3F7FD")],
+            foreground=[("disabled", "#8290A7")],
         )
         style.configure(
             "Success.TButton",
-            background="#147D68",
+            background="#0F8F74",
             foreground="#FFFFFF",
         )
         style.map(
             "Success.TButton",
             background=[
                 ("pressed", "#0E6655"),
-                ("active", "#19967C"),
-                ("disabled", "#A7D7CA"),
+                ("active", "#12A887"),
+                ("disabled", "#294B47"),
             ],
         )
         style.configure(
             "Secondary.TButton",
             background=COLOR_SURFACE_RAISED,
-            foreground="#40536B",
+            foreground="#C5D2E6",
+        )
+        style.configure(
+            "Outline.TButton",
+            background="#121D35",
+            foreground="#86A4FF",
+            bordercolor="#3F5FA8",
+            lightcolor="#3F5FA8",
+            darkcolor="#3F5FA8",
+            borderwidth=1,
+            relief=tk.SOLID,
+        )
+        style.map(
+            "Outline.TButton",
+            background=[
+                ("pressed", "#20345E"),
+                ("active", "#192A4F"),
+                ("disabled", "#111A2B"),
+            ],
+            foreground=[("disabled", "#596A84")],
+            bordercolor=[("active", COLOR_ACCENT)],
         )
         style.configure(
             "Icon.TButton",
@@ -715,15 +1245,15 @@ class BugStatisticsApp(tk.Tk):
         )
         style.configure(
             "Markdown.TButton",
-            background="#7357E8",
+            background="#7C5CFC",
             foreground="#FFFFFF",
         )
         style.map(
             "Markdown.TButton",
             background=[
-                ("pressed", "#5A3FC6"),
-                ("active", "#876EF0"),
-                ("disabled", "#C5BDEB"),
+                ("pressed", "#6547DB"),
+                ("active", "#9278FF"),
+                ("disabled", "#40365F"),
             ],
             foreground=[("disabled", "#F7F5FF")],
         )
@@ -750,28 +1280,31 @@ class BugStatisticsApp(tk.Tk):
         style.layout("Content.TNotebook.Tab", [])
         style.configure(
             "NavActive.TButton",
-            background="#E8F1FF",
-            foreground=COLOR_ACCENT,
-            borderwidth=0,
+            background="#1D2D57",
+            foreground="#8FB4FF",
+            bordercolor="#3D5DA3",
+            lightcolor="#3D5DA3",
+            darkcolor="#3D5DA3",
+            borderwidth=1,
             padding=(22, 10),
             font=("Microsoft YaHei UI", 10, "bold"),
         )
         style.map(
             "NavActive.TButton",
-            background=[("pressed", "#DCEAFF"), ("active", "#E2EDFF")],
-            foreground=[("active", COLOR_ACCENT)],
+            background=[("pressed", "#263B70"), ("active", "#233665")],
+            foreground=[("active", "#A9C7FF")],
         )
         style.configure(
             "NavInactive.TButton",
             background=COLOR_SURFACE,
-            foreground="#52637A",
+            foreground=COLOR_MUTED,
             borderwidth=0,
             padding=(22, 10),
             font=("Microsoft YaHei UI", 10, "bold"),
         )
         style.map(
             "NavInactive.TButton",
-            background=[("pressed", "#EDF3FA"), ("active", "#F2F6FB")],
+            background=[("pressed", "#1A263E"), ("active", "#162138")],
             foreground=[("active", COLOR_TEXT)],
         )
 
@@ -780,20 +1313,31 @@ class BugStatisticsApp(tk.Tk):
             background=COLOR_SURFACE,
             fieldbackground=COLOR_SURFACE,
             foreground=COLOR_TEXT,
+            bordercolor=COLOR_BORDER,
+            lightcolor=COLOR_BORDER,
+            darkcolor=COLOR_BORDER,
+            focuscolor=COLOR_BORDER,
             borderwidth=0,
             relief=tk.FLAT,
             rowheight=32,
             font=("Microsoft YaHei UI", 9),
         )
+        style.layout(
+            "Treeview",
+            [("Treeview.treearea", {"sticky": "nswe"})],
+        )
         style.map(
             "Treeview",
-            background=[("selected", COLOR_ACCENT)],
+            background=[("selected", "#29469A")],
             foreground=[("selected", "#FFFFFF")],
         )
         style.configure(
             "Treeview.Heading",
             background=COLOR_SURFACE_RAISED,
-            foreground="#40536B",
+            foreground="#B8C7DD",
+            bordercolor=COLOR_BORDER,
+            lightcolor=COLOR_BORDER,
+            darkcolor=COLOR_BORDER,
             borderwidth=0,
             relief=tk.FLAT,
             padding=(8, 8),
@@ -801,8 +1345,17 @@ class BugStatisticsApp(tk.Tk):
         )
         style.map(
             "Treeview.Heading",
-            background=[("active", "#DEEAF7")],
+            background=[("active", "#223250")],
             foreground=[("active", COLOR_TEXT)],
+        )
+        style.configure(
+            "Workload.Treeview",
+            rowheight=36,
+        )
+        style.map(
+            "Workload.Treeview",
+            background=[("selected", "#17284B")],
+            foreground=[("selected", COLOR_TEXT)],
         )
         for scrollbar_style in (
             "TScrollbar",
@@ -824,7 +1377,7 @@ class BugStatisticsApp(tk.Tk):
                 scrollbar_style,
                 background=[
                     ("pressed", COLOR_ACCENT),
-                    ("active", "#DCE8F6"),
+                    ("active", "#304360"),
                 ],
                 arrowcolor=[("active", COLOR_ACCENT)],
             )
@@ -842,11 +1395,28 @@ class BugStatisticsApp(tk.Tk):
         self.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self, padding=18)
+        outer = ttk.Frame(self, padding=20)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        header = ttk.Frame(outer, style="Header.TFrame")
-        header.pack(fill=tk.X, pady=(0, 14))
+        header_shell = tk.Frame(
+            outer,
+            background=COLOR_SURFACE,
+            highlightbackground="#2E4168",
+            highlightcolor=COLOR_CYAN,
+            highlightthickness=1,
+        )
+        header_shell.pack(fill=tk.X, pady=(0, 14))
+        tk.Frame(
+            header_shell,
+            height=2,
+            background=COLOR_ACCENT,
+        ).pack(fill=tk.X)
+        header = ttk.Frame(
+            header_shell,
+            style="Header.TFrame",
+            padding=(16, 12),
+        )
+        header.pack(fill=tk.X)
         tk.Frame(header, width=5, background=COLOR_CYAN).pack(
             side=tk.LEFT,
             fill=tk.Y,
@@ -868,7 +1438,7 @@ class BugStatisticsApp(tk.Tk):
         ).pack(side=tk.LEFT)
         ttk.Label(
             title_line,
-            text="绩效分析  /  CRM 检索  /  批量录入",
+            text="绩效分析  /  CRM 检索  /  工作量录入",
             style="SubTitle.TLabel",
         ).pack(side=tk.LEFT, padx=(16, 0), pady=(8, 0))
         self.login_status_var = tk.StringVar(value="未登录")
@@ -879,7 +1449,7 @@ class BugStatisticsApp(tk.Tk):
         )
         self.login_status_label.pack(
             side=tk.RIGHT,
-            pady=(8, 0),
+            pady=(7, 0),
         )
 
         self._build_login_controls(outer)
@@ -1145,9 +1715,8 @@ class BugStatisticsApp(tk.Tk):
         keyword_entry.bind("<Return>", lambda _event: self._apply_filter())
 
     def _build_workload_controls(self, parent: ttk.Frame) -> None:
-        controls = ttk.LabelFrame(parent, text="绩效工作量批量录入", padding=10)
+        controls = ttk.LabelFrame(parent, text="工作量录入", padding=10)
         controls.grid(row=0, column=0, sticky=tk.EW, pady=(0, 8))
-        controls.columnconfigure(9, weight=1)
 
         self.workload_plan_var = tk.StringVar(value=self.settings["plan_version"])
         self.workload_group_var = tk.StringVar(
@@ -1219,19 +1788,37 @@ class BugStatisticsApp(tk.Tk):
             style="Secondary.TButton",
         )
         self.workload_browse_button.grid(row=0, column=8, padx=(0, 8))
+        self.workload_template_button = ttk.Button(
+            controls,
+            text="下载模板",
+            command=self._download_workload_template,
+            style="Secondary.TButton",
+        )
+        self.workload_template_button.grid(row=0, column=9, padx=(0, 8))
+        self.workload_add_button = ttk.Button(
+            controls,
+            text="＋ 添加一行",
+            command=self._add_workload_row,
+            state=tk.DISABLED,
+            style="Outline.TButton",
+        )
+        self.workload_add_button.grid(row=0, column=10, padx=(0, 8))
         self.workload_preview_button = ttk.Button(
             controls,
             text="加载并预览",
             command=self._preview_workload,
             style="Accent.TButton",
         )
-        self.workload_preview_button.grid(row=0, column=9, sticky=tk.E)
+        self.workload_preview_button.grid(row=0, column=11, sticky=tk.E)
 
         ttk.Label(
             controls,
-            text="只读取 .xlsx；选择“全部组员”时，仅导入当前分组成员的数据。提交前会再次确认。",
+            text=(
+                "只读取 .xlsx；点击“添加一行”可直接在表格填写，"
+                "双击原有行的描述、日期或工时可修改。"
+            ),
             style="CardMuted.TLabel",
-        ).grid(row=1, column=0, columnspan=10, sticky=tk.W, pady=(8, 0))
+        ).grid(row=1, column=0, columnspan=12, sticky=tk.W, pady=(8, 0))
 
     def _build_workload_tab(self, parent: ttk.Frame) -> None:
         self._build_workload_controls(parent)
@@ -1240,6 +1827,10 @@ class BugStatisticsApp(tk.Tk):
         parent.rowconfigure(1, weight=1)
         parent.columnconfigure(0, weight=1)
         self.workload_tree = self._make_tree(preview_frame, WORKLOAD_COLUMNS)
+        self.workload_tree.configure(
+            style="Workload.Treeview",
+            selectmode="none",
+        )
         workload_text_columns = {"task_name", "message"}
         for key, _label, _width in WORKLOAD_COLUMNS:
             alignment = tk.W if key in workload_text_columns else tk.CENTER
@@ -1249,10 +1840,47 @@ class BugStatisticsApp(tk.Tk):
                 anchor=alignment,
                 stretch=key == "message",
             )
-        self.workload_tree.tag_configure("valid", background="#ECFDF5")
-        self.workload_tree.tag_configure("warning", background="#FFFBEB")
-        self.workload_tree.tag_configure("error", background="#FFF1F2")
-        self.workload_tree.tag_configure("duplicate", background="#F1F5F9")
+        self.workload_tree.heading(
+            "selected",
+            text="",
+        )
+        self.workload_select_all_button = tk.Button(
+            self.workload_tree,
+            text="☐",
+            command=self._toggle_all_workload_rows,
+            background=COLOR_SURFACE_RAISED,
+            activebackground="#24375B",
+            foreground="#9AABC4",
+            activeforeground=COLOR_ACCENT,
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+            cursor="hand2",
+            font=("Segoe UI Symbol", 15, "bold"),
+            takefocus=False,
+        )
+        self.workload_tree.tag_configure("valid", background="#0E2927")
+        self.workload_tree.tag_configure("warning", background="#332914")
+        self.workload_tree.tag_configure("pending", background="#142544")
+        self.workload_tree.tag_configure("error", background="#351B29")
+        self.workload_tree.tag_configure("duplicate", background="#20283A")
+        self.workload_tree.bind("<Button-1>", self._workload_tree_clicked)
+        self.workload_tree.bind("<Double-1>", self._edit_workload_cell)
+        self.workload_tree.bind("<Motion>", self._workload_tree_motion)
+        self.workload_tree.bind(
+            "<Leave>",
+            lambda _event: self.workload_tree.configure(cursor=""),
+        )
+        self.workload_tree.bind(
+            "<<TreeviewScroll>>",
+            self._position_workload_row_widgets,
+            add="+",
+        )
+        self.workload_tree.bind(
+            "<Configure>",
+            self._position_workload_row_widgets,
+            add="+",
+        )
 
         footer = ttk.Frame(parent, style="Card.TFrame", padding=(8, 8))
         footer.grid(row=2, column=0, sticky=tk.EW, pady=(8, 0))
@@ -1371,11 +1999,10 @@ class BugStatisticsApp(tk.Tk):
         self.crm_nav_button.pack(side=tk.LEFT, padx=(4, 0))
         self.workload_nav_button = ttk.Button(
             nav_content,
-            text="▤  绩效录入",
+            text="▤  工作量录入",
             command=lambda: self._select_main_tab("workload"),
             style="NavInactive.TButton",
         )
-        self.workload_nav_button.pack(side=tk.LEFT, padx=(4, 0))
 
         self.notebook = ttk.Notebook(parent, style="Content.TNotebook")
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -1385,7 +2012,6 @@ class BugStatisticsApp(tk.Tk):
         self.workload_tab = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(self.performance_detail_tab, text="绩效缺陷明细")
         self.notebook.add(self.crm_tab, text="CRM 缺陷查询")
-        self.notebook.add(self.workload_tab, text="绩效录入")
 
         self._build_performance_controls(self.performance_detail_tab)
         self._build_metrics(self.performance_detail_tab)
@@ -1489,6 +2115,27 @@ class BugStatisticsApp(tk.Tk):
         self._build_workload_tab(self.workload_tab)
         self._select_main_tab("performance")
 
+    def _can_access_workload(self) -> bool:
+        return self.logged_in and has_workload_access(self.performance_staff_number)
+
+    def _update_workload_access(self) -> None:
+        allowed = self._can_access_workload()
+        workload_tab_id = str(self.workload_tab)
+        workload_is_visible = workload_tab_id in self.notebook.tabs()
+        if allowed:
+            if not self.workload_nav_button.winfo_manager():
+                self.workload_nav_button.pack(side=tk.LEFT, padx=(4, 0))
+            if not workload_is_visible:
+                self.notebook.add(self.workload_tab, text="工作量录入")
+            return
+
+        if self.notebook.select() == workload_tab_id:
+            self._select_main_tab("performance")
+        self.workload_nav_button.pack_forget()
+        if workload_is_visible:
+            self.notebook.forget(self.workload_tab)
+        self._clear_workload_preview()
+
     def _select_main_tab(self, tab_name: str) -> None:
         tabs = {
             "performance": self.performance_detail_tab,
@@ -1496,6 +2143,8 @@ class BugStatisticsApp(tk.Tk):
             "workload": self.workload_tab,
         }
         selected = tab_name if tab_name in tabs else "performance"
+        if selected == "workload" and not self._can_access_workload():
+            selected = "performance"
         self.notebook.select(tabs[selected])
         self.performance_nav_button.configure(
             style=(
@@ -1583,7 +2232,7 @@ class BugStatisticsApp(tk.Tk):
                 self._handle_worker_message(operation, payload)
         except queue.Empty:
             pass
-        self.after(100, self._poll_worker_messages)
+        self._worker_poll_after_id = self.after(100, self._poll_worker_messages)
 
     def _handle_worker_message(self, operation: str, payload: Any) -> None:
         self._set_busy(False)
@@ -1592,6 +2241,8 @@ class BugStatisticsApp(tk.Tk):
             self.login_status_label.configure(style="Connected.TLabel")
             performance_result, _crm_result = payload
             self.performance_display_name = performance_result.display_name
+            self.performance_staff_number = performance_result.staff_number
+            self._update_workload_access()
             self.introducer_var.set(performance_result.display_name)
             self.login_status_var.set(
                 f"已登录：{performance_result.display_name}"
@@ -1634,9 +2285,14 @@ class BugStatisticsApp(tk.Tk):
             self._save_settings()
             return
         if operation == "workload_preview:success":
-            context, preview = payload
+            context, items, preview = payload
             self.workload_context = context
+            self.workload_items = items
+            self.workload_added_rows.clear()
             self.workload_preview = preview
+            self.workload_selected_rows = {
+                row.source.excel_row for row in preview.submittable_rows
+            }
             developers = [ALL_GROUP_MEMBERS, *sorted(context.developers)]
             self.workload_developer_combo.configure(values=developers)
             if self.workload_developer_var.get() not in developers:
@@ -1648,9 +2304,13 @@ class BugStatisticsApp(tk.Tk):
             result: WorkloadSubmitResult = payload
             self.workload_context = None
             self.workload_preview = None
+            self.workload_items = []
+            self.workload_added_rows.clear()
+            self.workload_selected_rows.clear()
+            self.workload_add_button.configure(state=tk.DISABLED)
             self.workload_submit_button.configure(state=tk.DISABLED)
             self.status_var.set(
-                f"绩效录入完成：提交 {result.submitted_count} 条，"
+                f"工作量录入完成：提交 {result.submitted_count} 条，"
                 f"回查确认 {result.verified_count} 条"
             )
             self.workload_summary_var.set(
@@ -1715,6 +2375,8 @@ class BugStatisticsApp(tk.Tk):
                 (AuthenticationError, CrmAuthenticationError),
             ):
                 self.logged_in = False
+                self.performance_staff_number = ""
+                self._update_workload_access()
                 self.login_status_var.set("未登录")
                 self.login_status_label.configure(style="LoginStatus.TLabel")
             self.status_var.set(str(payload))
@@ -1734,8 +2396,10 @@ class BugStatisticsApp(tk.Tk):
             self.crm_previous_button,
             self.crm_next_button,
             self.workload_browse_button,
+            self.workload_template_button,
             self.workload_preview_button,
             self.workload_clear_button,
+            self.workload_add_button,
             self.workload_submit_button,
         ]:
             button.configure(state=state)
@@ -1751,7 +2415,14 @@ class BugStatisticsApp(tk.Tk):
                     tk.NORMAL
                     if self.workload_context
                     and self.workload_preview
-                    and self.workload_preview.submittable_rows
+                    and self._selected_workload_rows()
+                    else tk.DISABLED
+                )
+            )
+            self.workload_add_button.configure(
+                state=(
+                    tk.NORMAL
+                    if self.workload_context and self.workload_preview is not None
                     else tk.DISABLED
                 )
             )
@@ -1820,12 +2491,14 @@ class BugStatisticsApp(tk.Tk):
         self._save_settings()
 
     def _load_workload_groups(self) -> None:
-        if not self.logged_in:
+        if not self._can_access_workload():
             return
         self.status_var.set("正在读取可录入的绩效分组…")
         self._run_worker("workload_groups", self.workload_api.get_groups)
 
     def _apply_workload_groups(self, groups: list[Any]) -> None:
+        if not self._can_access_workload():
+            return
         values = [group.name for group in groups]
         self.workload_group_combo.configure(values=values)
         if not values:
@@ -1841,12 +2514,12 @@ class BugStatisticsApp(tk.Tk):
             else values[0]
         )
         self.workload_group_var.set(selected)
-        self.status_var.set(f"已加载 {len(values)} 个绩效录入分组")
+        self.status_var.set(f"已加载 {len(values)} 个工作量录入分组")
         self._save_settings()
         self._load_workload_developers()
 
     def _load_workload_developers(self) -> None:
-        if not self.logged_in:
+        if not self._can_access_workload():
             return
         module = self.workload_group_var.get().strip()
         if not module:
@@ -1858,6 +2531,8 @@ class BugStatisticsApp(tk.Tk):
         )
 
     def _choose_workload_file(self) -> None:
+        if not self._can_access_workload():
+            return
         initial_path = self.workload_file_var.get().strip()
         initial_directory = (
             str(Path(initial_path).parent)
@@ -1877,15 +2552,66 @@ class BugStatisticsApp(tk.Tk):
         self.status_var.set(f"已选择 Excel：{Path(selected).name}")
         self._save_settings()
 
+    def _download_workload_template(self) -> None:
+        if not self._can_access_workload():
+            messagebox.showinfo(APP_TITLE, "当前账号无工作量录入权限", parent=self)
+            return
+
+        initial_path = self.workload_file_var.get().strip()
+        initial_directory = (
+            Path(initial_path).parent
+            if initial_path and Path(initial_path).parent.exists()
+            else Path.home() / "Downloads"
+        )
+        if not initial_directory.exists():
+            initial_directory = Path.home() / "Desktop"
+        output_path = filedialog.asksaveasfilename(
+            parent=self,
+            title="下载绩效工作量导入模板",
+            initialdir=str(initial_directory),
+            initialfile="绩效工作量导入模板.xlsx",
+            defaultextension=".xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx")],
+        )
+        if not output_path:
+            return
+
+        try:
+            saved_path = copy_workload_template(output_path)
+        except OSError as exc:
+            messagebox.showerror(
+                APP_TITLE,
+                f"模板下载失败：{exc}",
+                parent=self,
+            )
+            return
+        self.workload_file_var.set(str(saved_path))
+        self._clear_workload_preview()
+        self._save_settings()
+        self.status_var.set(f"模板已保存并选中：{saved_path}")
+        messagebox.showinfo(
+            APP_TITLE,
+            f"模板下载完成，并已自动选中\n{saved_path}",
+            parent=self,
+        )
+
     def _clear_workload_preview(self) -> None:
+        self._close_workload_editor()
+        self._close_workload_add_dialog()
+        self._destroy_workload_row_widgets()
         self.workload_context = None
         self.workload_preview = None
+        self.workload_items = []
+        self.workload_added_rows.clear()
+        self.workload_selected_rows.clear()
         if hasattr(self, "workload_tree"):
             self.workload_tree.delete(*self.workload_tree.get_children())
         if hasattr(self, "workload_summary_var"):
             self.workload_summary_var.set("请选择 Excel，加载后先预览校验结果")
         if hasattr(self, "workload_submit_button"):
             self.workload_submit_button.configure(state=tk.DISABLED)
+        if hasattr(self, "workload_add_button"):
+            self.workload_add_button.configure(state=tk.DISABLED)
 
     def _workload_group_changed(self, _event: tk.Event | None = None) -> None:
         self.workload_developer_var.set(ALL_GROUP_MEMBERS)
@@ -1895,8 +2621,8 @@ class BugStatisticsApp(tk.Tk):
         self._load_workload_developers()
 
     def _preview_workload(self) -> None:
-        if not self.logged_in:
-            messagebox.showinfo(APP_TITLE, "请先登录", parent=self)
+        if not self._can_access_workload():
+            messagebox.showinfo(APP_TITLE, "当前账号无工作量录入权限", parent=self)
             return
         plan_version = self.workload_plan_var.get().strip()
         module = self.workload_group_var.get().strip()
@@ -1917,15 +2643,115 @@ class BugStatisticsApp(tk.Tk):
             f"正在校验 {Path(excel_path).name}，目标 {plan_version} / {module}…"
         )
 
-        def build_preview() -> tuple[WorkloadContext, WorkloadPreview]:
+        def build_preview() -> tuple[
+            WorkloadContext,
+            list[ExcelWorkItem],
+            WorkloadPreview,
+        ]:
             context = self.workload_api.get_context(plan_version, module)
             items = read_workload_excel(excel_path, plan_version)
             preview = build_workload_preview(items, context, developer_filter)
-            return context, preview
+            return context, items, preview
 
         self._run_worker("workload_preview", build_preview)
 
+    def _workload_pending_fields(self, row: Any) -> list[str]:
+        """返回新增行中尚未填写的必填字段。"""
+
+        if row.source.excel_row not in self.workload_added_rows:
+            return []
+        source = row.source
+        missing: list[str] = []
+        if not source.developer_name.strip():
+            missing.append("责任人")
+        if not source.require_no.strip():
+            missing.append("需求编号")
+        if not source.task_name.strip():
+            missing.append("工作描述")
+        if not source.plan_start_date.strip():
+            missing.append("计划开始")
+        if not source.plan_finish_date.strip():
+            missing.append("计划完成")
+        if source.requested_days <= 0:
+            missing.append("Excel 工时")
+        return missing
+
+    def _workload_source_cell_value(
+        self,
+        excel_row: int,
+        column_key: str,
+    ) -> str:
+        source = next(
+            (
+                item
+                for item in self.workload_items
+                if item.excel_row == excel_row
+            ),
+            None,
+        )
+        if source is None:
+            return ""
+        values = {
+            "developer": source.developer_name,
+            "require_no": source.require_no,
+            "task_name": source.task_name,
+            "plan_start": source.plan_start_date,
+            "plan_finish": source.plan_finish_date,
+            "requested_hours": (
+                f"{source.requested_days * 8:g}"
+                if source.requested_days > 0
+                else ""
+            ),
+        }
+        return str(values.get(column_key, ""))
+
+    def _workload_editable_display_value(
+        self,
+        row: Any,
+        column_key: str,
+    ) -> str:
+        raw_value = self._workload_source_cell_value(
+            row.source.excel_row,
+            column_key,
+        )
+        field_name = WORKLOAD_EDITABLE_COLUMNS.get(column_key, "")
+        if field_name in self._workload_pending_fields(row):
+            return "待填写"
+        return raw_value
+
+    def _workload_display_state(self, row: Any) -> tuple[str, str, str]:
+        """生成表格使用的状态、短提示和底部完整提示。"""
+
+        missing = self._workload_pending_fields(row)
+        if missing:
+            fields = "、".join(missing)
+            return (
+                "待填写",
+                f"还需填写 {len(missing)} 项",
+                f"待填写：{fields}",
+            )
+
+        messages = [
+            part.strip()
+            for part in str(row.message or "").split("；")
+            if part.strip()
+        ]
+        detail = "；".join(messages) or row.status
+        if row.status == "错误":
+            compact = messages[0] if messages else "校验未通过"
+            if len(messages) > 1:
+                compact += f" 等 {len(messages)} 项"
+        elif row.status == "已存在":
+            compact = "检测到重复任务"
+        elif row.status == "提醒":
+            compact = "工时计算不一致" if messages else "请检查"
+        else:
+            compact = "校验通过"
+        return row.status, compact, detail
+
     def _render_workload_preview(self) -> None:
+        self._close_workload_editor()
+        self._destroy_workload_row_widgets()
         self.workload_tree.delete(*self.workload_tree.get_children())
         preview = self.workload_preview
         if preview is None:
@@ -1933,70 +2759,717 @@ class BugStatisticsApp(tk.Tk):
         tag_by_status = {
             "可提交": "valid",
             "提醒": "warning",
+            "待填写": "pending",
             "错误": "error",
             "已存在": "duplicate",
         }
         for row in preview.rows:
             source = row.source
+            display_status, display_message, _detail = self._workload_display_state(row)
+            pending_fields = self._workload_pending_fields(row)
             self.workload_tree.insert(
                 "",
                 tk.END,
+                iid=str(source.excel_row),
                 values=(
-                    source.excel_row,
-                    row.status,
-                    source.developer_name,
-                    source.require_no,
-                    source.task_name,
-                    source.plan_start_date,
-                    source.plan_finish_date,
-                    f"{source.requested_days * 8:g}",
-                    f"{row.computed_hours:g}",
-                    row.message,
+                    "☑" if source.excel_row in self.workload_selected_rows else "☐",
+                    "新增" if source.excel_row in self.workload_added_rows else source.excel_row,
+                    display_status,
+                    self._workload_editable_display_value(row, "developer"),
+                    self._workload_editable_display_value(row, "require_no"),
+                    self._workload_editable_display_value(row, "task_name"),
+                    self._workload_editable_display_value(row, "plan_start"),
+                    self._workload_editable_display_value(row, "plan_finish"),
+                    self._workload_editable_display_value(row, "requested_hours"),
+                    "—" if pending_fields else f"{row.computed_hours:g}",
+                    display_message,
+                    "删除",
                 ),
-                tags=(tag_by_status.get(row.status, ""),),
+                tags=(tag_by_status.get(display_status, ""),),
             )
+        self._create_workload_row_widgets()
         ignored_hint = (
             "；非本组责任人：" + "、".join(preview.ignored_developers)
             if preview.ignored_developers
             else ""
         )
+        selected_rows = self._selected_workload_rows()
+        selected_requested_hours = round(
+            sum(row.source.requested_days * 8 for row in selected_rows), 2
+        )
+        selected_computed_hours = round(
+            sum(row.computed_hours for row in selected_rows), 2
+        )
+        pending_count = sum(
+            bool(self._workload_pending_fields(row)) for row in preview.rows
+        )
+        display_error_count = max(0, preview.error_count - pending_count)
         self.workload_summary_var.set(
-            f"Excel 有效数据 {preview.source_row_count} 行，匹配 {len(preview.rows)} 行，"
+            f"当前数据 {preview.source_row_count} 行，匹配 {len(preview.rows)} 行，"
             f"可提交 {len(preview.submittable_rows)} 行（提醒 {preview.warning_count}），"
-            f"错误 {preview.error_count} 行，已存在 {preview.duplicate_count} 行，"
+            f"已勾选 {len(selected_rows)} 行，"
+            f"待填写 {pending_count} 行，错误 {display_error_count} 行，"
+            f"已存在 {preview.duplicate_count} 行，"
             f"跳过 {preview.skipped_row_count} 行；"
-            f"Excel {preview.requested_hours:g}h / 计算 {preview.computed_hours:g}h"
+            f"勾选工时 Excel {selected_requested_hours:g}h / "
+            f"计算 {selected_computed_hours:g}h"
             f"{ignored_hint}"
         )
         self.status_var.set(
-            f"预览完成：{len(preview.submittable_rows)} 条可以提交，"
-            f"{preview.error_count} 条需要修正"
+            f"预览完成：已勾选 {len(selected_rows)} / "
+            f"{len(preview.submittable_rows)} 条可提交记录，"
+            f"{pending_count} 条待填写，{display_error_count} 条需要修正"
         )
         self.workload_submit_button.configure(
-            state=tk.NORMAL if preview.submittable_rows else tk.DISABLED
+            state=tk.NORMAL if selected_rows else tk.DISABLED
+        )
+        self.workload_add_button.configure(state=tk.NORMAL)
+        self._update_workload_select_all_heading()
+
+    def _destroy_workload_row_widgets(self) -> None:
+        for checkbox, status_label, delete_button in getattr(
+            self,
+            "workload_row_widgets",
+            {},
+        ).values():
+            checkbox.destroy()
+            status_label.destroy()
+            delete_button.destroy()
+        self.workload_row_widgets = {}
+
+    def _create_workload_row_widgets(self) -> None:
+        preview = self.workload_preview
+        if preview is None:
+            return
+        background_by_status = {
+            "可提交": "#0E2927",
+            "提醒": "#332914",
+            "待填写": "#142544",
+            "错误": "#351B29",
+            "已存在": "#20283A",
+        }
+        foreground_by_status = {
+            "可提交": "#45E0B2",
+            "提醒": "#FBCB50",
+            "待填写": "#79A7FF",
+            "错误": "#FF7F96",
+            "已存在": "#FF7F96",
+        }
+        for row in preview.rows:
+            excel_row = row.source.excel_row
+            selected = excel_row in self.workload_selected_rows
+            display_status, _message, _detail = self._workload_display_state(row)
+            background = background_by_status.get(display_status, COLOR_SURFACE)
+            checkbox = tk.Button(
+                self.workload_tree,
+                text="☑" if selected else "☐",
+                command=lambda row_number=excel_row: self._toggle_workload_row(
+                    row_number
+                ),
+                background=background,
+                activebackground="#24375B",
+                foreground=COLOR_CYAN if selected else "#9AABC4",
+                activeforeground=COLOR_ACCENT,
+                disabledforeground="#53627A",
+                relief=tk.FLAT,
+                borderwidth=0,
+                highlightthickness=0,
+                cursor="hand2" if row.is_submittable else "no",
+                font=("Segoe UI Symbol", 15, "bold"),
+                takefocus=False,
+            )
+            if not row.is_submittable:
+                checkbox.configure(state=tk.DISABLED)
+            status_label = tk.Label(
+                self.workload_tree,
+                text=display_status,
+                background=background,
+                foreground=foreground_by_status.get(display_status, COLOR_TEXT),
+                font=("Microsoft YaHei UI", 9, "bold"),
+                borderwidth=0,
+                highlightthickness=0,
+            )
+            delete_button = tk.Button(
+                self.workload_tree,
+                text="删除",
+                command=lambda row_number=excel_row: self._delete_workload_row(
+                    row_number
+                ),
+                background=background,
+                activebackground="#4A2031",
+                foreground="#FF7F96",
+                activeforeground="#FF9CAF",
+                relief=tk.FLAT,
+                borderwidth=0,
+                highlightthickness=0,
+                cursor="hand2",
+                font=("Microsoft YaHei UI", 9, "bold"),
+                takefocus=False,
+            )
+            self.workload_row_widgets[str(excel_row)] = (
+                checkbox,
+                status_label,
+                delete_button,
+            )
+        self.after_idle(self._position_workload_row_widgets)
+
+    def _position_workload_row_widgets(
+        self,
+        _event: tk.Event | None = None,
+    ) -> None:
+        if not hasattr(self, "workload_tree") or not self.workload_tree.winfo_exists():
+            return
+        children = self.workload_tree.get_children()
+        first_bounds = (
+            self.workload_tree.bbox(children[0], "selected")
+            if children
+            else ()
+        )
+        if first_bounds:
+            header_x, header_height = first_bounds[0], first_bounds[1]
+            header_width = first_bounds[2]
+        else:
+            header_x = 0
+            header_height = 24
+            header_width = int(self.workload_tree.column("selected", "width"))
+        self.workload_select_all_button.place(
+            x=header_x + 1,
+            y=1,
+            width=max(1, header_width - 2),
+            height=max(1, header_height - 2),
+        )
+        self.workload_select_all_button.lift()
+        for item_id, (
+            checkbox,
+            status_label,
+            delete_button,
+        ) in self.workload_row_widgets.items():
+            for widget, column_key in (
+                (checkbox, "selected"),
+                (status_label, "status"),
+                (delete_button, "action"),
+            ):
+                bounds = self.workload_tree.bbox(item_id, column_key)
+                if not bounds:
+                    widget.place_forget()
+                    continue
+                x, y, width, height = bounds
+                widget.place(
+                    x=x + 1,
+                    y=y + 1,
+                    width=max(1, width - 2),
+                    height=max(1, height - 2),
+                )
+                widget.lift()
+
+    def _selected_workload_rows(self) -> list[Any]:
+        preview = self.workload_preview
+        if preview is None:
+            return []
+        return [
+            row
+            for row in preview.submittable_rows
+            if row.source.excel_row in self.workload_selected_rows
+        ]
+
+    def _workload_column_key(self, column_id: str) -> str:
+        try:
+            index = int(column_id.removeprefix("#")) - 1
+            return str(self.workload_tree["columns"][index])
+        except (ValueError, IndexError):
+            return ""
+
+    def _workload_column_id(self, column_key: str) -> str:
+        try:
+            index = list(self.workload_tree["columns"]).index(column_key) + 1
+            return f"#{index}"
+        except ValueError:
+            return ""
+
+    def _workload_tree_clicked(self, event: tk.Event) -> str | None:
+        if self.workload_tree.identify_region(event.x, event.y) != "cell":
+            return None
+        item_id = self.workload_tree.identify_row(event.y)
+        column_id = self.workload_tree.identify_column(event.x)
+        column_key = self._workload_column_key(column_id)
+        if not item_id:
+            return None
+        excel_row = int(item_id)
+        if column_key == "selected":
+            self._toggle_workload_row(excel_row)
+            return "break"
+        if column_key == "action":
+            self._delete_workload_row(excel_row)
+            return "break"
+        if column_key in {"status", "message"}:
+            row = next(
+                (
+                    candidate
+                    for candidate in (
+                        self.workload_preview.rows if self.workload_preview else []
+                    )
+                    if candidate.source.excel_row == excel_row
+                ),
+                None,
+            )
+            if row is not None:
+                _status, _message, detail = self._workload_display_state(row)
+                row_label = (
+                    "新增行"
+                    if excel_row in self.workload_added_rows
+                    else f"Excel 第 {excel_row} 行"
+                )
+                self.status_var.set(f"{row_label}：{detail}")
+            return "break"
+        if (
+            excel_row in self.workload_added_rows
+            and column_key in WORKLOAD_EDITABLE_COLUMNS
+        ):
+            return self._open_workload_cell_editor(item_id, column_id)
+        return None
+
+    def _toggle_workload_row(self, excel_row: int) -> None:
+        selectable_rows = {
+            row.source.excel_row
+            for row in (
+                self.workload_preview.submittable_rows
+                if self.workload_preview
+                else []
+            )
+        }
+        if excel_row not in selectable_rows:
+            self.status_var.set("当前记录尚未通过校验，暂时不能勾选")
+            return
+        if excel_row in self.workload_selected_rows:
+            self.workload_selected_rows.remove(excel_row)
+        else:
+            self.workload_selected_rows.add(excel_row)
+        self._render_workload_preview()
+
+    def _toggle_all_workload_rows(self) -> None:
+        selectable_rows = {
+            row.source.excel_row
+            for row in (
+                self.workload_preview.submittable_rows
+                if self.workload_preview
+                else []
+            )
+        }
+        if not selectable_rows:
+            self.status_var.set("当前没有可勾选的记录")
+            return
+        if selectable_rows.issubset(self.workload_selected_rows):
+            self.workload_selected_rows.difference_update(selectable_rows)
+        else:
+            self.workload_selected_rows.update(selectable_rows)
+        self._render_workload_preview()
+
+    def _update_workload_select_all_heading(self) -> None:
+        selectable_rows = {
+            row.source.excel_row
+            for row in (
+                self.workload_preview.submittable_rows
+                if self.workload_preview
+                else []
+            )
+        }
+        selected_count = len(selectable_rows & self.workload_selected_rows)
+        if selectable_rows and selected_count == len(selectable_rows):
+            marker = "☑"
+        elif selected_count:
+            marker = "◩"
+        else:
+            marker = "☐"
+        self.workload_select_all_button.configure(
+            text=marker,
+            foreground=COLOR_CYAN if selected_count else "#9AABC4",
         )
 
+    def _workload_tree_motion(self, event: tk.Event) -> None:
+        cursor = ""
+        region = self.workload_tree.identify_region(event.x, event.y)
+        if region == "heading":
+            column_key = self._workload_column_key(
+                self.workload_tree.identify_column(event.x)
+            )
+            if column_key == "selected":
+                cursor = "hand2"
+        elif region == "cell":
+            column_key = self._workload_column_key(
+                self.workload_tree.identify_column(event.x)
+            )
+            if column_key in {
+                "selected",
+                "action",
+                "status",
+                "message",
+                "plan_start",
+                "plan_finish",
+            }:
+                if column_key == "selected":
+                    item_id = self.workload_tree.identify_row(event.y)
+                    selectable_rows = {
+                        row.source.excel_row
+                        for row in (
+                            self.workload_preview.submittable_rows
+                            if self.workload_preview
+                            else []
+                        )
+                    }
+                    cursor = (
+                        "hand2"
+                        if item_id and int(item_id) in selectable_rows
+                        else "no"
+                    )
+                else:
+                    cursor = "hand2"
+            elif column_key in {
+                "developer",
+                "require_no",
+                "task_name",
+                "requested_hours",
+            }:
+                cursor = "xterm"
+        if self.workload_tree.cget("cursor") != cursor:
+            self.workload_tree.configure(cursor=cursor)
+
+    def _delete_workload_row(self, excel_row: int) -> None:
+        self._close_workload_editor()
+        row_label = (
+            "新增行"
+            if excel_row in self.workload_added_rows
+            else f"Excel 第 {excel_row} 行"
+        )
+        self.workload_items = [
+            item for item in self.workload_items if item.excel_row != excel_row
+        ]
+        self.workload_added_rows.discard(excel_row)
+        self.workload_selected_rows.discard(excel_row)
+        self._rebuild_workload_preview()
+        self.status_var.set(f"已从本次预览删除{row_label}")
+
+    def _add_workload_row(self) -> None:
+        context = self.workload_context
+        if context is None or self.workload_preview is None:
+            messagebox.showinfo(APP_TITLE, "请先加载 Excel 预览", parent=self)
+            return
+        next_row = max(
+            (item.excel_row for item in self.workload_items),
+            default=1,
+        ) + 1
+        selected_developer = self.workload_developer_var.get().strip()
+        item = ExcelWorkItem(
+            excel_row=next_row,
+            require_no="",
+            task_name="",
+            plan_start_date="",
+            plan_finish_date="",
+            requested_days=0,
+            developer_name=(
+                selected_developer
+                if selected_developer in context.developers
+                else ""
+            ),
+        )
+        self._accept_added_workload_row(item)
+        self.workload_tree.see(str(next_row))
+        self.status_var.set(
+            "已添加空白行；请点击责任人、需求编号、工作描述、"
+            "计划日期和 Excel 工时进行填写"
+        )
+        self.after_idle(
+            lambda: self._open_workload_cell_editor(
+                str(next_row),
+                self._workload_column_id("developer"),
+            )
+        )
+
+    def _accept_added_workload_row(self, item: ExcelWorkItem) -> None:
+        previously_submittable = {
+            row.source.excel_row
+            for row in (
+                self.workload_preview.submittable_rows
+                if self.workload_preview
+                else []
+            )
+        }
+        self.workload_items.append(item)
+        self.workload_added_rows.add(item.excel_row)
+        self._rebuild_workload_preview(previously_submittable)
+        matching_row = next(
+            (
+                row
+                for row in (self.workload_preview.rows if self.workload_preview else [])
+                if row.source.excel_row == item.excel_row
+            ),
+            None,
+        )
+        if matching_row is None:
+            self.status_var.set("新增记录不符合当前责任人筛选，未显示在预览中")
+        else:
+            display_status, _message, _detail = self._workload_display_state(
+                matching_row
+            )
+            self.status_var.set(
+                f"已添加一行，当前状态：{display_status}"
+            )
+
+    def _close_workload_add_dialog(self) -> None:
+        dialog = getattr(self, "workload_add_dialog", None)
+        self.workload_add_dialog = None
+        if dialog is not None and dialog.winfo_exists():
+            dialog._close()
+
+    def _edit_workload_cell(self, event: tk.Event) -> str | None:
+        if self.workload_tree.identify_region(event.x, event.y) != "cell":
+            return None
+        item_id = self.workload_tree.identify_row(event.y)
+        column_id = self.workload_tree.identify_column(event.x)
+        column_key = self._workload_column_key(column_id)
+        if not item_id or column_key not in WORKLOAD_EDITABLE_COLUMNS:
+            return None
+        excel_row = int(item_id)
+        if (
+            column_key in {"developer", "require_no"}
+            and excel_row not in self.workload_added_rows
+        ):
+            self.status_var.set("责任人和需求编号仅支持在新增行中填写")
+            return "break"
+        return self._open_workload_cell_editor(item_id, column_id)
+
+    def _open_workload_cell_editor(
+        self,
+        item_id: str,
+        column_id: str,
+    ) -> str:
+        column_key = self._workload_column_key(column_id)
+        if not column_key:
+            return "break"
+        bounds = self.workload_tree.bbox(item_id, column_id)
+        if not bounds:
+            return "break"
+        self._close_workload_editor()
+        x, y, width, height = bounds
+        current_value = self._workload_source_cell_value(
+            int(item_id),
+            column_key,
+        )
+        if column_key in {"plan_start", "plan_finish"}:
+            excel_row = int(item_id)
+
+            def apply_date(selected_value: str) -> None:
+                self.workload_date_picker = None
+                self._apply_workload_edit(
+                    excel_row,
+                    column_key,
+                    selected_value,
+                )
+
+            self.workload_date_picker = DatePickerPopup(
+                self.workload_tree,
+                current_value,
+                apply_date,
+                self.workload_tree.winfo_rootx() + x,
+                self.workload_tree.winfo_rooty() + y + height,
+            )
+            return "break"
+        if column_key == "developer":
+            context = self.workload_context
+            if context is None:
+                return "break"
+            editor = ttk.Combobox(
+                self.workload_tree,
+                values=sorted(context.developers),
+                state="readonly",
+                style="WorkloadEditor.TCombobox",
+            )
+        else:
+            editor = ttk.Entry(
+                self.workload_tree,
+                style="WorkloadEditor.TEntry",
+            )
+        self.workload_editor = editor
+        editor.set(current_value) if isinstance(editor, ttk.Combobox) else editor.insert(
+            0,
+            current_value,
+        )
+        if isinstance(editor, ttk.Entry):
+            editor.select_range(0, tk.END)
+        editor.place(
+            x=x + 2,
+            y=y + 2,
+            width=max(1, width - 4),
+            height=max(1, height - 4),
+        )
+        editor.focus_set()
+        if isinstance(editor, ttk.Combobox):
+            editor.bind(
+                "<<ComboboxSelected>>",
+                lambda _event: self._commit_workload_edit(
+                    int(item_id),
+                    column_key,
+                    editor.get(),
+                ),
+            )
+        editor.bind(
+            "<Return>",
+            lambda _event: self._commit_workload_edit(
+                int(item_id), column_key, editor.get()
+            ),
+        )
+        editor.bind("<Escape>", lambda _event: self._close_workload_editor())
+        if not isinstance(editor, ttk.Combobox):
+            editor.bind(
+                "<FocusOut>",
+                lambda _event: self._commit_workload_edit(
+                    int(item_id),
+                    column_key,
+                    editor.get(),
+                ),
+            )
+        return "break"
+
+    def _close_workload_editor(self) -> None:
+        editor = getattr(self, "workload_editor", None)
+        self.workload_editor = None
+        if editor is not None and editor.winfo_exists():
+            editor.destroy()
+        date_picker = getattr(self, "workload_date_picker", None)
+        self.workload_date_picker = None
+        if date_picker is not None and date_picker.winfo_exists():
+            date_picker.destroy()
+
+    def _commit_workload_edit(
+        self,
+        excel_row: int,
+        column_key: str,
+        raw_value: str,
+    ) -> str:
+        if self.workload_editor is None:
+            return "break"
+        self._close_workload_editor()
+        return self._apply_workload_edit(excel_row, column_key, raw_value)
+
+    def _apply_workload_edit(
+        self,
+        excel_row: int,
+        column_key: str,
+        raw_value: str,
+    ) -> str:
+        item_index = next(
+            (
+                index
+                for index, item in enumerate(self.workload_items)
+                if item.excel_row == excel_row
+            ),
+            None,
+        )
+        if item_index is None:
+            return "break"
+        item = self.workload_items[item_index]
+        value = raw_value.strip()
+        changes: dict[str, Any]
+        if column_key == "developer":
+            changes = {"developer_name": value}
+        elif column_key == "require_no":
+            changes = {"require_no": value}
+        elif column_key == "task_name":
+            changes = {"task_name": value}
+        elif column_key == "plan_start":
+            changes = {"plan_start_date": value}
+        elif column_key == "plan_finish":
+            changes = {"plan_finish_date": value}
+        elif column_key == "requested_hours":
+            try:
+                hours = float(value.removesuffix("h").removesuffix("H").strip())
+                if not isfinite(hours):
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    APP_TITLE,
+                    "Excel 工时请输入数字，例如 19.2",
+                    parent=self,
+                )
+                self._render_workload_preview()
+                return "break"
+            changes = {"requested_days": hours / 8}
+        else:
+            return "break"
+        previously_submittable = {
+            row.source.excel_row
+            for row in (
+                self.workload_preview.submittable_rows
+                if self.workload_preview
+                else []
+            )
+        }
+        self.workload_items[item_index] = replace(item, **changes)
+        self._rebuild_workload_preview(previously_submittable)
+        row_label = "新增行" if excel_row in self.workload_added_rows else (
+            f"Excel 第 {excel_row} 行"
+        )
+        self.status_var.set(
+            f"已修改{row_label}的{WORKLOAD_EDITABLE_COLUMNS[column_key]}，并重新校验"
+        )
+        return "break"
+
+    def _rebuild_workload_preview(
+        self,
+        previously_submittable: set[int] | None = None,
+    ) -> None:
+        context = self.workload_context
+        if context is None:
+            return
+        old_submittable = previously_submittable
+        if old_submittable is None:
+            old_submittable = {
+                row.source.excel_row
+                for row in (
+                    self.workload_preview.submittable_rows
+                    if self.workload_preview
+                    else []
+                )
+            }
+        self.workload_preview = build_workload_preview(
+            self.workload_items,
+            context,
+            self.workload_developer_var.get().strip() or ALL_GROUP_MEMBERS,
+        )
+        new_submittable = {
+            row.source.excel_row for row in self.workload_preview.submittable_rows
+        }
+        self.workload_selected_rows.intersection_update(new_submittable)
+        self.workload_selected_rows.update(new_submittable - old_submittable)
+        self._render_workload_preview()
+
     def _submit_workload(self) -> None:
+        if not self._can_access_workload():
+            messagebox.showinfo(APP_TITLE, "当前账号无工作量录入权限", parent=self)
+            return
         context = self.workload_context
         preview = self.workload_preview
-        if context is None or preview is None or not preview.submittable_rows:
-            messagebox.showinfo(APP_TITLE, "请先加载并检查导入预览", parent=self)
+        selected_rows = self._selected_workload_rows()
+        if context is None or preview is None or not selected_rows:
+            messagebox.showinfo(APP_TITLE, "请先加载并勾选要导入的记录", parent=self)
             return
-        count = len(preview.submittable_rows)
+        count = len(selected_rows)
+        selected_computed_hours = round(
+            sum(row.computed_hours for row in selected_rows), 2
+        )
         confirmed = messagebox.askyesno(
             APP_TITLE,
             "即将向绩效系统写入工作量：\n\n"
             f"计划版本：{context.plan_version}\n"
             f"录入分组：{context.module}\n"
             f"新增记录：{count} 条\n"
-            f"计算工时：{preview.computed_hours:g} 小时\n\n"
+            f"计算工时：{selected_computed_hours:g} 小时\n\n"
             "系统会一次批量保存，并在保存后自动回查。确认提交吗？",
             icon="warning",
             parent=self,
         )
         if not confirmed:
             return
-        rows = list(preview.submittable_rows)
+        rows = list(selected_rows)
         self.status_var.set(f"正在批量保存 {count} 条绩效工作量…")
         self._run_worker(
             "workload_submit",
@@ -2598,6 +4071,12 @@ class BugStatisticsApp(tk.Tk):
         self._run_worker("md_export", build_export)
 
     def _on_close(self) -> None:
+        if self._worker_poll_after_id is not None:
+            try:
+                self.after_cancel(self._worker_poll_after_id)
+            except tk.TclError:
+                pass
+            self._worker_poll_after_id = None
         self._save_settings()
         self.client.close()
         self.crm_client.close()
@@ -2605,7 +4084,30 @@ class BugStatisticsApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 4 and sys.argv[1] == "--diagnose-workload-excel":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--diagnose-workload-template":
+        diagnostic_output = Path(sys.argv[2])
+        try:
+            copy_workload_template(diagnostic_output)
+        except Exception as exc:
+            diagnostic_output.with_suffix(".error.txt").write_text(
+                str(exc),
+                encoding="utf-8",
+            )
+    elif len(sys.argv) >= 4 and sys.argv[1] == "--diagnose-open-office-excel":
+        diagnostic_output = Path(sys.argv[3])
+        diagnostic_content = _read_open_office_xlsx_bytes(Path(sys.argv[2]))
+        diagnostic_output.write_text(
+            json.dumps(
+                {
+                    "success": diagnostic_content is not None,
+                    "byteCount": len(diagnostic_content or b""),
+                    "diagnostics": office_snapshot_diagnostics(),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    elif len(sys.argv) >= 4 and sys.argv[1] == "--diagnose-workload-excel":
         diagnostic_output = Path(sys.argv[3])
         try:
             diagnostic_items = read_workload_excel(sys.argv[2], "2026-0830")
