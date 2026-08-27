@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import calendar
+import ctypes
 import json
 import io
 import os
@@ -62,7 +63,7 @@ from workload_client import (
 
 
 APP_TITLE = "缺陷统计客户端"
-APP_VERSION = "v18.23"
+APP_VERSION = "v18.30"
 WINDOW_TITLE = f"{APP_TITLE}  {APP_VERSION}"
 WORKLOAD_ALLOWED_USERS = frozenset({"T0423", "T0101"})
 APP_DIR = Path(__file__).resolve().parent
@@ -70,19 +71,67 @@ WORKLOAD_TEMPLATE_RELATIVE_PATH = Path("assets") / "workload_import_template.xls
 SETTINGS_DIR = Path(os.environ.get("APPDATA", APP_DIR)) / "BugStatisticsClient"
 SETTINGS_PATH = SETTINGS_DIR / "settings.json"
 CREDENTIALS_PATH = SETTINGS_DIR / "credentials.dat"
-COLOR_BG = "#070B17"
-COLOR_SURFACE = "#0F172A"
-COLOR_SURFACE_ALT = "#121C31"
-COLOR_SURFACE_RAISED = "#19243B"
-COLOR_BORDER = "#2A3858"
-COLOR_TEXT = "#E8EEF9"
-COLOR_MUTED = "#8FA1BC"
-COLOR_ACCENT = "#5B7CFF"
-COLOR_ACCENT_HOVER = "#7390FF"
-COLOR_CYAN = "#28D7F4"
-COLOR_SUCCESS = "#34D399"
-COLOR_WARNING = "#FBBF24"
-COLOR_DANGER = "#FB7185"
+THEME_PALETTES = {
+    "dark": {
+        "bg": "#070B17",
+        "surface": "#0F172A",
+        "surface_alt": "#121C31",
+        "surface_raised": "#19243B",
+        "border": "#2A3858",
+        "text": "#E8EEF9",
+        "muted": "#8FA1BC",
+        "accent": "#5B7CFF",
+        "accent_hover": "#7390FF",
+        "cyan": "#28D7F4",
+        "success": "#34D399",
+        "warning": "#FBBF24",
+        "danger": "#FB7185",
+    },
+    "light": {
+        "bg": "#F3F6FB",
+        "surface": "#FFFFFF",
+        "surface_alt": "#F7F9FC",
+        "surface_raised": "#E7EDF7",
+        "border": "#CBD5E1",
+        "text": "#172033",
+        "muted": "#64748B",
+        "accent": "#4F6EF7",
+        "accent_hover": "#6682FF",
+        "cyan": "#0891B2",
+        "success": "#059669",
+        "warning": "#D97706",
+        "danger": "#E11D48",
+    },
+}
+ACTIVE_THEME = "dark"
+
+
+def _apply_theme_palette(theme_name: str) -> None:
+    """Update shared palette colors used by the Tk and ttk widgets."""
+    global ACTIVE_THEME
+    global COLOR_BG, COLOR_SURFACE, COLOR_SURFACE_ALT, COLOR_SURFACE_RAISED
+    global COLOR_BORDER, COLOR_TEXT, COLOR_MUTED, COLOR_ACCENT
+    global COLOR_ACCENT_HOVER, COLOR_CYAN, COLOR_SUCCESS, COLOR_WARNING
+    global COLOR_DANGER
+
+    ACTIVE_THEME = theme_name if theme_name in THEME_PALETTES else "dark"
+    palette = THEME_PALETTES[ACTIVE_THEME]
+    COLOR_BG = palette["bg"]
+    COLOR_SURFACE = palette["surface"]
+    COLOR_SURFACE_ALT = palette["surface_alt"]
+    COLOR_SURFACE_RAISED = palette["surface_raised"]
+    COLOR_BORDER = palette["border"]
+    COLOR_TEXT = palette["text"]
+    COLOR_MUTED = palette["muted"]
+    COLOR_ACCENT = palette["accent"]
+    COLOR_ACCENT_HOVER = palette["accent_hover"]
+    COLOR_CYAN = palette["cyan"]
+    COLOR_SUCCESS = palette["success"]
+    COLOR_WARNING = palette["warning"]
+    COLOR_DANGER = palette["danger"]
+
+
+_apply_theme_palette("dark")
 DEFAULT_SETTINGS = {
     "base_url": DEFAULT_BASE_URL,
     "username": "T0423",
@@ -91,6 +140,7 @@ DEFAULT_SETTINGS = {
     "workload_group": DEFAULT_WORKLOAD_GROUP,
     "workload_developer": ALL_GROUP_MEMBERS,
     "workload_file": "",
+    "theme": "dark",
 }
 CRM_TABLE_COLUMNS = CRM_SEARCH_COLUMNS
 
@@ -147,8 +197,8 @@ WORKLOAD_COLUMNS = [
     ("task_name", "工作描述", 360),
     ("plan_start", "计划开始", 105),
     ("plan_finish", "计划完成", 105),
-    ("requested_hours", "Excel 工时（小时）", 112),
-    ("computed_hours", "计算工时（小时）", 112),
+    ("requested_hours", "Excel 工时（天）", 112),
+    ("computed_hours", "计算工时（天）", 112),
     ("message", "校验信息", 320),
     ("action", "操作", 72),
 ]
@@ -163,6 +213,80 @@ WORKLOAD_EDITABLE_COLUMNS = {
 }
 
 
+def _monitor_work_area(
+    window: tk.Misc,
+    anchor_x: int,
+    anchor_y: int,
+) -> tuple[int, int, int, int]:
+    """Return the usable area of the monitor containing the popup anchor."""
+    fallback = (0, 0, window.winfo_screenwidth(), window.winfo_screenheight())
+    if sys.platform != "win32":
+        return fallback
+
+    class Point(ctypes.Structure):
+        _fields_ = (("x", ctypes.c_long), ("y", ctypes.c_long))
+
+    class Rect(ctypes.Structure):
+        _fields_ = (
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        )
+
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = (
+            ("cbSize", ctypes.c_ulong),
+            ("rcMonitor", Rect),
+            ("rcWork", Rect),
+            ("dwFlags", ctypes.c_ulong),
+        )
+
+    try:
+        user32 = ctypes.windll.user32
+        monitor = user32.MonitorFromPoint(Point(anchor_x, anchor_y), 2)
+        info = MonitorInfo(cbSize=ctypes.sizeof(MonitorInfo))
+        if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            work = info.rcWork
+            return work.left, work.top, work.right, work.bottom
+    except (AttributeError, OSError):
+        pass
+    return fallback
+
+
+def _fit_popup_position(
+    anchor_x: int,
+    anchor_top: int,
+    anchor_bottom: int,
+    popup_width: int,
+    popup_height: int,
+    work_area: tuple[int, int, int, int],
+    margin: int = 8,
+) -> tuple[int, int]:
+    """Keep a popup in the work area, preferring below then above its anchor."""
+    left, top, right, bottom = work_area
+    usable_left = left + margin
+    usable_top = top + margin
+    usable_right = max(usable_left, right - margin)
+    usable_bottom = max(usable_top, bottom - margin)
+    x = max(usable_left, min(anchor_x, usable_right - popup_width))
+    if anchor_bottom + popup_height <= usable_bottom:
+        y = anchor_bottom
+    elif anchor_top - popup_height >= usable_top:
+        y = anchor_top - popup_height
+    else:
+        y = max(usable_top, min(anchor_bottom, usable_bottom - popup_height))
+    return x, y
+
+
+def _tree_row_is_fully_visible(
+    bounds: tuple[int, ...],
+    viewport_height: int,
+) -> bool:
+    """Only show embedded row widgets when the complete tree row is visible."""
+    return bool(bounds) and bounds[1] >= 0 and bounds[1] + bounds[3] <= viewport_height
+
+
 class DatePickerPopup(tk.Toplevel):
     """轻量日期选择器，避免为桌面客户端额外引入第三方依赖。"""
 
@@ -173,6 +297,7 @@ class DatePickerPopup(tk.Toplevel):
         on_select: Callable[[str], None],
         anchor_x: int,
         anchor_y: int,
+        anchor_top: int | None = None,
     ) -> None:
         super().__init__(parent)
         try:
@@ -247,10 +372,19 @@ class DatePickerPopup(tk.Toplevel):
         self.update_idletasks()
         popup_width = self.winfo_reqwidth()
         popup_height = self.winfo_reqheight()
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-        x = max(0, min(anchor_x, screen_width - popup_width))
-        y = max(0, min(anchor_y, screen_height - popup_height))
+        # winfo_reqheight excludes the native title bar and window borders.
+        # Reserve their actual top inset plus a small bottom-border allowance.
+        decoration_height = max(0, self.winfo_rooty() - self.winfo_y()) + 8
+        outer_height = popup_height + decoration_height
+        work_area = _monitor_work_area(self, anchor_x, anchor_y)
+        x, y = _fit_popup_position(
+            anchor_x,
+            anchor_y if anchor_top is None else anchor_top,
+            anchor_y,
+            popup_width,
+            outer_height,
+            work_area,
+        )
         self.geometry(f"+{x}+{y}")
         self.grab_set()
         self.focus_force()
@@ -389,7 +523,7 @@ class WorkloadAddDialog(tk.Toplevel):
         )
         developer_combo.grid(row=1, column=1, sticky=tk.W, pady=5)
 
-        ttk.Label(body, text="Excel 工时", style="Card.TLabel").grid(
+        ttk.Label(body, text="Excel 工时（天）", style="Card.TLabel").grid(
             row=1,
             column=2,
             sticky=tk.E,
@@ -518,6 +652,7 @@ class WorkloadAddDialog(tk.Toplevel):
             apply_date,
             anchor.winfo_rootx(),
             anchor.winfo_rooty() + anchor.winfo_height(),
+            anchor.winfo_rooty(),
         )
 
     def _submit(self) -> None:
@@ -527,13 +662,13 @@ class WorkloadAddDialog(tk.Toplevel):
         start_date = self.plan_start_var.get().strip()
         finish_date = self.plan_finish_var.get().strip()
         try:
-            requested_hours = float(self.hours_var.get().strip())
-            if not isfinite(requested_hours) or requested_hours <= 0:
+            requested_days = float(self.hours_var.get().strip())
+            if not isfinite(requested_days) or requested_days <= 0:
                 raise ValueError
         except ValueError:
             messagebox.showerror(
                 APP_TITLE,
-                "Excel 工时请输入大于 0 的数字，例如 19.2",
+                "Excel 工时请输入大于 0 的天数，例如 2.5",
                 parent=self,
             )
             return
@@ -569,7 +704,7 @@ class WorkloadAddDialog(tk.Toplevel):
             task_name=task_name,
             plan_start_date=start_date,
             plan_finish_date=finish_date,
-            requested_days=requested_hours / 8,
+            requested_days=requested_days,
             developer_name=developer_name,
         )
         callback = self.on_add
@@ -927,9 +1062,14 @@ class BugStatisticsApp(tk.Tk):
         self.title(WINDOW_TITLE)
         self.geometry("1380x860")
         self.minsize(1100, 680)
-        self.configure(background=COLOR_BG)
-
         self.settings = self._load_settings()
+        self.theme_name = (
+            self.settings.get("theme", "dark")
+            if self.settings.get("theme") in THEME_PALETTES
+            else "dark"
+        )
+        _apply_theme_palette(self.theme_name)
+        self.configure(background=COLOR_BG)
         self.credentials = load_credentials(CREDENTIALS_PATH)
         self.client = BugApiClient(self.settings["base_url"])
         self.workload_api = WorkloadApiClient(self.client)
@@ -983,6 +1123,7 @@ class BugStatisticsApp(tk.Tk):
             "workload_group": self.workload_group_var.get().strip(),
             "workload_developer": self.workload_developer_var.get().strip(),
             "workload_file": self.workload_file_var.get().strip(),
+            "theme": self.theme_name,
         }
         try:
             SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -997,6 +1138,10 @@ class BugStatisticsApp(tk.Tk):
         style = ttk.Style(self)
         if "clam" in style.theme_names():
             style.theme_use("clam")
+        is_light = self.theme_name == "light"
+
+        def tone(dark: str, light: str) -> str:
+            return light if is_light else dark
 
         default_font = ("Microsoft YaHei UI", 10)
         style.configure(
@@ -1054,15 +1199,15 @@ class BugStatisticsApp(tk.Tk):
         )
         style.configure(
             "LoginStatus.TLabel",
-            background="#2D2517",
-            foreground="#FBBF24",
+            background=tone("#2D2517", "#FFF7E6"),
+            foreground=tone("#FBBF24", "#B45309"),
             padding=(12, 7),
             font=("Microsoft YaHei UI", 9, "bold"),
         )
         style.configure(
             "Connected.TLabel",
-            background="#123129",
-            foreground="#5EE7B7",
+            background=tone("#123129", "#DCFCE7"),
+            foreground=tone("#5EE7B7", "#047857"),
             padding=(12, 7),
             font=("Microsoft YaHei UI", 9, "bold"),
         )
@@ -1104,8 +1249,8 @@ class BugStatisticsApp(tk.Tk):
             bordercolor=[("focus", COLOR_CYAN)],
             lightcolor=[("focus", COLOR_CYAN)],
             darkcolor=[("focus", COLOR_CYAN)],
-            fieldbackground=[("disabled", "#101827")],
-            foreground=[("disabled", "#64748B")],
+            fieldbackground=[("disabled", tone("#101827", "#E2E8F0"))],
+            foreground=[("disabled", tone("#64748B", "#94A3B8"))],
         )
         style.configure(
             "TCombobox",
@@ -1131,7 +1276,7 @@ class BugStatisticsApp(tk.Tk):
         )
         style.configure(
             "WorkloadEditor.TEntry",
-            fieldbackground="#17233B",
+            fieldbackground=tone("#17233B", "#FFFFFF"),
             foreground=COLOR_TEXT,
             insertcolor=COLOR_TEXT,
             bordercolor=COLOR_CYAN,
@@ -1148,8 +1293,8 @@ class BugStatisticsApp(tk.Tk):
         )
         style.configure(
             "WorkloadEditor.TCombobox",
-            fieldbackground="#17233B",
-            background="#17233B",
+            fieldbackground=tone("#17233B", "#FFFFFF"),
+            background=tone("#17233B", "#FFFFFF"),
             foreground=COLOR_TEXT,
             arrowcolor=COLOR_CYAN,
             bordercolor=COLOR_CYAN,
@@ -1159,9 +1304,12 @@ class BugStatisticsApp(tk.Tk):
         )
         style.map(
             "WorkloadEditor.TCombobox",
-            fieldbackground=[("readonly", "#17233B"), ("focus", "#17233B")],
+            fieldbackground=[
+                ("readonly", tone("#17233B", "#FFFFFF")),
+                ("focus", tone("#17233B", "#FFFFFF")),
+            ],
             foreground=[("readonly", COLOR_TEXT)],
-            selectbackground=[("readonly", "#17233B")],
+            selectbackground=[("readonly", tone("#17233B", "#FFFFFF"))],
             selectforeground=[("readonly", COLOR_TEXT)],
             bordercolor=[("focus", COLOR_CYAN)],
         )
@@ -1179,11 +1327,11 @@ class BugStatisticsApp(tk.Tk):
         style.map(
             "TButton",
             background=[
-                ("pressed", "#263755"),
-                ("active", "#22314E"),
-                ("disabled", "#111A2B"),
+                ("pressed", tone("#263755", "#D6E0EF")),
+                ("active", tone("#22314E", "#EEF2F8")),
+                ("disabled", tone("#111A2B", "#E9EEF5")),
             ],
-            foreground=[("disabled", "#596A84")],
+            foreground=[("disabled", tone("#596A84", "#94A3B8"))],
         )
         style.configure(
             "Accent.TButton",
@@ -1215,26 +1363,26 @@ class BugStatisticsApp(tk.Tk):
         style.configure(
             "Secondary.TButton",
             background=COLOR_SURFACE_RAISED,
-            foreground="#C5D2E6",
+            foreground=tone("#C5D2E6", "#334155"),
         )
         style.configure(
             "Outline.TButton",
-            background="#121D35",
-            foreground="#86A4FF",
-            bordercolor="#3F5FA8",
-            lightcolor="#3F5FA8",
-            darkcolor="#3F5FA8",
+            background=tone("#121D35", "#FFFFFF"),
+            foreground=tone("#86A4FF", "#3658D4"),
+            bordercolor=tone("#3F5FA8", "#8EA3E8"),
+            lightcolor=tone("#3F5FA8", "#8EA3E8"),
+            darkcolor=tone("#3F5FA8", "#8EA3E8"),
             borderwidth=1,
             relief=tk.SOLID,
         )
         style.map(
             "Outline.TButton",
             background=[
-                ("pressed", "#20345E"),
-                ("active", "#192A4F"),
-                ("disabled", "#111A2B"),
+                ("pressed", tone("#20345E", "#E2E8F8")),
+                ("active", tone("#192A4F", "#F1F5FF")),
+                ("disabled", tone("#111A2B", "#EEF2F7")),
             ],
-            foreground=[("disabled", "#596A84")],
+            foreground=[("disabled", tone("#596A84", "#94A3B8"))],
             bordercolor=[("active", COLOR_ACCENT)],
         )
         style.configure(
@@ -1242,6 +1390,17 @@ class BugStatisticsApp(tk.Tk):
             background=COLOR_SURFACE_RAISED,
             foreground=COLOR_CYAN,
             padding=(5, 5),
+        )
+        style.configure(
+            "Theme.TButton",
+            background=COLOR_SURFACE_RAISED,
+            foreground=COLOR_TEXT,
+            bordercolor=COLOR_BORDER,
+            lightcolor=COLOR_BORDER,
+            darkcolor=COLOR_BORDER,
+            borderwidth=1,
+            relief=tk.SOLID,
+            padding=(10, 6),
         )
         style.configure(
             "Markdown.TButton",
@@ -1280,19 +1439,22 @@ class BugStatisticsApp(tk.Tk):
         style.layout("Content.TNotebook.Tab", [])
         style.configure(
             "NavActive.TButton",
-            background="#1D2D57",
-            foreground="#8FB4FF",
-            bordercolor="#3D5DA3",
-            lightcolor="#3D5DA3",
-            darkcolor="#3D5DA3",
+            background=tone("#1D2D57", "#E5ECFF"),
+            foreground=tone("#8FB4FF", "#3154C8"),
+            bordercolor=tone("#3D5DA3", "#9AADEA"),
+            lightcolor=tone("#3D5DA3", "#9AADEA"),
+            darkcolor=tone("#3D5DA3", "#9AADEA"),
             borderwidth=1,
             padding=(22, 10),
             font=("Microsoft YaHei UI", 10, "bold"),
         )
         style.map(
             "NavActive.TButton",
-            background=[("pressed", "#263B70"), ("active", "#233665")],
-            foreground=[("active", "#A9C7FF")],
+            background=[
+                ("pressed", tone("#263B70", "#D8E3FF")),
+                ("active", tone("#233665", "#EDF2FF")),
+            ],
+            foreground=[("active", tone("#A9C7FF", "#2447B8"))],
         )
         style.configure(
             "NavInactive.TButton",
@@ -1304,7 +1466,10 @@ class BugStatisticsApp(tk.Tk):
         )
         style.map(
             "NavInactive.TButton",
-            background=[("pressed", "#1A263E"), ("active", "#162138")],
+            background=[
+                ("pressed", tone("#1A263E", "#E2E8F0")),
+                ("active", tone("#162138", "#F1F5F9")),
+            ],
             foreground=[("active", COLOR_TEXT)],
         )
 
@@ -1328,13 +1493,13 @@ class BugStatisticsApp(tk.Tk):
         )
         style.map(
             "Treeview",
-            background=[("selected", "#29469A")],
-            foreground=[("selected", "#FFFFFF")],
+            background=[("selected", tone("#29469A", "#C9D7FF"))],
+            foreground=[("selected", tone("#FFFFFF", "#172033"))],
         )
         style.configure(
             "Treeview.Heading",
             background=COLOR_SURFACE_RAISED,
-            foreground="#B8C7DD",
+            foreground=tone("#B8C7DD", "#475569"),
             bordercolor=COLOR_BORDER,
             lightcolor=COLOR_BORDER,
             darkcolor=COLOR_BORDER,
@@ -1345,7 +1510,7 @@ class BugStatisticsApp(tk.Tk):
         )
         style.map(
             "Treeview.Heading",
-            background=[("active", "#223250")],
+            background=[("active", tone("#223250", "#DCE5F2"))],
             foreground=[("active", COLOR_TEXT)],
         )
         style.configure(
@@ -1354,7 +1519,7 @@ class BugStatisticsApp(tk.Tk):
         )
         style.map(
             "Workload.Treeview",
-            background=[("selected", "#17284B")],
+            background=[("selected", tone("#17284B", "#DCE6FF"))],
             foreground=[("selected", COLOR_TEXT)],
         )
         for scrollbar_style in (
@@ -1451,6 +1616,14 @@ class BugStatisticsApp(tk.Tk):
             side=tk.RIGHT,
             pady=(7, 0),
         )
+        self.theme_button = ttk.Button(
+            header,
+            text=self._theme_button_text(),
+            command=self._toggle_theme,
+            style="Theme.TButton",
+            cursor="hand2",
+        )
+        self.theme_button.pack(side=tk.RIGHT, padx=(0, 10), pady=(7, 0))
 
         self._build_login_controls(outer)
         self._build_tables(outer)
@@ -1466,6 +1639,123 @@ class BugStatisticsApp(tk.Tk):
         self.progress = ttk.Progressbar(status_frame, mode="indeterminate", length=160)
         self.progress.pack(side=tk.RIGHT)
         self._build_loading_windows()
+
+    def _theme_button_text(self) -> str:
+        return "☀  浅色" if self.theme_name == "dark" else "🌙  深色"
+
+    def _toggle_theme(self) -> None:
+        old_theme = self.theme_name
+        self.theme_name = "light" if old_theme == "dark" else "dark"
+        old_palette = THEME_PALETTES[old_theme]
+        _apply_theme_palette(self.theme_name)
+        self.settings["theme"] = self.theme_name
+        self.configure(background=COLOR_BG)
+        self._configure_style()
+        self.theme_button.configure(text=self._theme_button_text())
+        self._recolor_classic_widgets(old_theme, old_palette)
+        self._refresh_theme_trees()
+        self._save_settings()
+
+    def _recolor_classic_widgets(
+        self,
+        old_theme: str,
+        old_palette: dict[str, str],
+    ) -> None:
+        new_palette = THEME_PALETTES[self.theme_name]
+        color_map = {
+            old_palette[key].lower(): new_palette[key]
+            for key in old_palette
+        }
+        dark_extras = {
+            "#2e4168": "#CBD5E1",
+            "#0e2927": "#DCFCE7",
+            "#332914": "#FEF3C7",
+            "#142544": "#DBEAFE",
+            "#351b29": "#FFE4E6",
+            "#20283a": "#E2E8F0",
+            "#24375b": "#DCE6F5",
+            "#4a2031": "#FFE4E6",
+            "#9aabc4": "#64748B",
+            "#53627a": "#94A3B8",
+            "#45e0b2": "#047857",
+            "#fbcb50": "#B45309",
+            "#79a7ff": "#3154C8",
+            "#ff7f96": "#BE123C",
+            "#ff9caf": "#E11D48",
+        }
+        if old_theme == "dark":
+            color_map.update(dark_extras)
+        else:
+            color_map.update({value.lower(): key for key, value in dark_extras.items()})
+
+        options = (
+            "background",
+            "foreground",
+            "activebackground",
+            "activeforeground",
+            "disabledforeground",
+            "highlightbackground",
+            "highlightcolor",
+            "insertbackground",
+            "selectbackground",
+            "selectforeground",
+        )
+
+        def recolor(widget: tk.Misc) -> None:
+            changes: dict[str, str] = {}
+            for option in options:
+                try:
+                    current = str(widget.cget(option)).lower()
+                except tk.TclError:
+                    continue
+                replacement = color_map.get(current)
+                if replacement:
+                    changes[option] = replacement
+            if changes:
+                try:
+                    widget.configure(**changes)
+                except tk.TclError:
+                    pass
+            for child in widget.winfo_children():
+                recolor(child)
+
+        recolor(self)
+        for window_name in ("loading_dimmer", "loading_dialog"):
+            window = getattr(self, window_name, None)
+            if window is not None:
+                recolor(window)
+
+    def _refresh_theme_trees(self) -> None:
+        for tree_name in ("detail_tree", "crm_tree", "workload_tree"):
+            tree = getattr(self, tree_name, None)
+            if tree is None:
+                continue
+            tree.tag_configure("evenrow", background=COLOR_SURFACE)
+            tree.tag_configure("oddrow", background=COLOR_SURFACE_ALT)
+        workload_tree = getattr(self, "workload_tree", None)
+        if workload_tree is not None:
+            light = self.theme_name == "light"
+            workload_tree.tag_configure(
+                "valid", background="#DCFCE7" if light else "#0E2927"
+            )
+            workload_tree.tag_configure(
+                "warning", background="#FEF3C7" if light else "#332914"
+            )
+            workload_tree.tag_configure(
+                "pending", background="#DBEAFE" if light else "#142544"
+            )
+            workload_tree.tag_configure(
+                "error", background="#FFE4E6" if light else "#351B29"
+            )
+            workload_tree.tag_configure(
+                "duplicate", background="#E2E8F0" if light else "#20283A"
+            )
+        if self.workload_preview is not None:
+            self._render_workload_preview()
+        if self.filtered_bugs:
+            self._render_details()
+        if self.crm_bug_page is not None:
+            self._render_crm_bugs()
 
     def _build_loading_windows(self) -> None:
         self.loading_dimmer = tk.Toplevel(self)
@@ -1849,8 +2139,8 @@ class BugStatisticsApp(tk.Tk):
             text="☐",
             command=self._toggle_all_workload_rows,
             background=COLOR_SURFACE_RAISED,
-            activebackground="#24375B",
-            foreground="#9AABC4",
+            activebackground="#DCE6F5" if self.theme_name == "light" else "#24375B",
+            foreground="#64748B" if self.theme_name == "light" else "#9AABC4",
             activeforeground=COLOR_ACCENT,
             relief=tk.FLAT,
             borderwidth=0,
@@ -1859,11 +2149,7 @@ class BugStatisticsApp(tk.Tk):
             font=("Segoe UI Symbol", 15, "bold"),
             takefocus=False,
         )
-        self.workload_tree.tag_configure("valid", background="#0E2927")
-        self.workload_tree.tag_configure("warning", background="#332914")
-        self.workload_tree.tag_configure("pending", background="#142544")
-        self.workload_tree.tag_configure("error", background="#351B29")
-        self.workload_tree.tag_configure("duplicate", background="#20283A")
+        self._refresh_theme_trees()
         self.workload_tree.bind("<Button-1>", self._workload_tree_clicked)
         self.workload_tree.bind("<Double-1>", self._edit_workload_cell)
         self.workload_tree.bind("<Motion>", self._workload_tree_motion)
@@ -2698,7 +2984,7 @@ class BugStatisticsApp(tk.Tk):
             "plan_start": source.plan_start_date,
             "plan_finish": source.plan_finish_date,
             "requested_hours": (
-                f"{source.requested_days * 8:g}"
+                f"{source.requested_days:g}"
                 if source.requested_days > 0
                 else ""
             ),
@@ -2781,7 +3067,7 @@ class BugStatisticsApp(tk.Tk):
                     self._workload_editable_display_value(row, "plan_start"),
                     self._workload_editable_display_value(row, "plan_finish"),
                     self._workload_editable_display_value(row, "requested_hours"),
-                    "—" if pending_fields else f"{row.computed_hours:g}",
+                    "—" if pending_fields else f"{row.computed_hours / 8:g}",
                     display_message,
                     "删除",
                 ),
@@ -2794,11 +3080,11 @@ class BugStatisticsApp(tk.Tk):
             else ""
         )
         selected_rows = self._selected_workload_rows()
-        selected_requested_hours = round(
-            sum(row.source.requested_days * 8 for row in selected_rows), 2
+        selected_requested_days = round(
+            sum(row.source.requested_days for row in selected_rows), 2
         )
-        selected_computed_hours = round(
-            sum(row.computed_hours for row in selected_rows), 2
+        selected_computed_days = round(
+            sum(row.computed_hours / 8 for row in selected_rows), 2
         )
         pending_count = sum(
             bool(self._workload_pending_fields(row)) for row in preview.rows
@@ -2811,8 +3097,8 @@ class BugStatisticsApp(tk.Tk):
             f"待填写 {pending_count} 行，错误 {display_error_count} 行，"
             f"已存在 {preview.duplicate_count} 行，"
             f"跳过 {preview.skipped_row_count} 行；"
-            f"勾选工时 Excel {selected_requested_hours:g}h / "
-            f"计算 {selected_computed_hours:g}h"
+            f"勾选工时 Excel {selected_requested_days:g}天 / "
+            f"计算 {selected_computed_days:g}天"
             f"{ignored_hint}"
         )
         self.status_var.set(
@@ -2841,20 +3127,36 @@ class BugStatisticsApp(tk.Tk):
         preview = self.workload_preview
         if preview is None:
             return
-        background_by_status = {
-            "可提交": "#0E2927",
-            "提醒": "#332914",
-            "待填写": "#142544",
-            "错误": "#351B29",
-            "已存在": "#20283A",
-        }
-        foreground_by_status = {
-            "可提交": "#45E0B2",
-            "提醒": "#FBCB50",
-            "待填写": "#79A7FF",
-            "错误": "#FF7F96",
-            "已存在": "#FF7F96",
-        }
+        if self.theme_name == "light":
+            background_by_status = {
+                "可提交": "#DCFCE7",
+                "提醒": "#FEF3C7",
+                "待填写": "#DBEAFE",
+                "错误": "#FFE4E6",
+                "已存在": "#E2E8F0",
+            }
+            foreground_by_status = {
+                "可提交": "#047857",
+                "提醒": "#B45309",
+                "待填写": "#3154C8",
+                "错误": "#BE123C",
+                "已存在": "#BE123C",
+            }
+        else:
+            background_by_status = {
+                "可提交": "#0E2927",
+                "提醒": "#332914",
+                "待填写": "#142544",
+                "错误": "#351B29",
+                "已存在": "#20283A",
+            }
+            foreground_by_status = {
+                "可提交": "#45E0B2",
+                "提醒": "#FBCB50",
+                "待填写": "#79A7FF",
+                "错误": "#FF7F96",
+                "已存在": "#FF7F96",
+            }
         for row in preview.rows:
             excel_row = row.source.excel_row
             selected = excel_row in self.workload_selected_rows
@@ -2867,10 +3169,18 @@ class BugStatisticsApp(tk.Tk):
                     row_number
                 ),
                 background=background,
-                activebackground="#24375B",
-                foreground=COLOR_CYAN if selected else "#9AABC4",
+                activebackground=(
+                    "#DCE6F5" if self.theme_name == "light" else "#24375B"
+                ),
+                foreground=(
+                    COLOR_CYAN
+                    if selected
+                    else "#64748B" if self.theme_name == "light" else "#9AABC4"
+                ),
                 activeforeground=COLOR_ACCENT,
-                disabledforeground="#53627A",
+                disabledforeground=(
+                    "#94A3B8" if self.theme_name == "light" else "#53627A"
+                ),
                 relief=tk.FLAT,
                 borderwidth=0,
                 highlightthickness=0,
@@ -2896,9 +3206,13 @@ class BugStatisticsApp(tk.Tk):
                     row_number
                 ),
                 background=background,
-                activebackground="#4A2031",
-                foreground="#FF7F96",
-                activeforeground="#FF9CAF",
+                activebackground=(
+                    "#FFE4E6" if self.theme_name == "light" else "#4A2031"
+                ),
+                foreground="#BE123C" if self.theme_name == "light" else "#FF7F96",
+                activeforeground=(
+                    "#E11D48" if self.theme_name == "light" else "#FF9CAF"
+                ),
                 relief=tk.FLAT,
                 borderwidth=0,
                 highlightthickness=0,
@@ -2950,7 +3264,10 @@ class BugStatisticsApp(tk.Tk):
                 (delete_button, "action"),
             ):
                 bounds = self.workload_tree.bbox(item_id, column_key)
-                if not bounds:
+                if not _tree_row_is_fully_visible(
+                    bounds,
+                    self.workload_tree.winfo_height(),
+                ):
                     widget.place_forget()
                     continue
                 x, y, width, height = bounds
@@ -3082,7 +3399,11 @@ class BugStatisticsApp(tk.Tk):
             marker = "☐"
         self.workload_select_all_button.configure(
             text=marker,
-            foreground=COLOR_CYAN if selected_count else "#9AABC4",
+            foreground=(
+                COLOR_CYAN
+                if selected_count
+                else "#64748B" if self.theme_name == "light" else "#9AABC4"
+            ),
         )
 
     def _workload_tree_motion(self, event: tk.Event) -> None:
@@ -3271,6 +3592,7 @@ class BugStatisticsApp(tk.Tk):
                 apply_date,
                 self.workload_tree.winfo_rootx() + x,
                 self.workload_tree.winfo_rooty() + y + height,
+                self.workload_tree.winfo_rooty() + y,
             )
             return "break"
         if column_key == "developer":
@@ -3381,18 +3703,18 @@ class BugStatisticsApp(tk.Tk):
             changes = {"plan_finish_date": value}
         elif column_key == "requested_hours":
             try:
-                hours = float(value.removesuffix("h").removesuffix("H").strip())
-                if not isfinite(hours):
+                days = float(value.removesuffix("天").strip())
+                if not isfinite(days):
                     raise ValueError
             except ValueError:
                 messagebox.showerror(
                     APP_TITLE,
-                    "Excel 工时请输入数字，例如 19.2",
+                    "Excel 工时请输入天数，例如 2.5",
                     parent=self,
                 )
                 self._render_workload_preview()
                 return "break"
-            changes = {"requested_days": hours / 8}
+            changes = {"requested_days": days}
         else:
             return "break"
         previously_submittable = {
@@ -3453,8 +3775,8 @@ class BugStatisticsApp(tk.Tk):
             messagebox.showinfo(APP_TITLE, "请先加载并勾选要导入的记录", parent=self)
             return
         count = len(selected_rows)
-        selected_computed_hours = round(
-            sum(row.computed_hours for row in selected_rows), 2
+        selected_computed_days = round(
+            sum(row.computed_hours / 8 for row in selected_rows), 2
         )
         confirmed = messagebox.askyesno(
             APP_TITLE,
@@ -3462,7 +3784,7 @@ class BugStatisticsApp(tk.Tk):
             f"计划版本：{context.plan_version}\n"
             f"录入分组：{context.module}\n"
             f"新增记录：{count} 条\n"
-            f"计算工时：{selected_computed_hours:g} 小时\n\n"
+            f"计算工时：{selected_computed_days:g} 天\n\n"
             "系统会一次批量保存，并在保存后自动回查。确认提交吗？",
             icon="warning",
             parent=self,
@@ -3676,7 +3998,10 @@ class BugStatisticsApp(tk.Tk):
         for item_id in self.crm_tree.get_children():
             bounds = self.crm_tree.bbox(item_id, "objectNumber")
             widgets = self.crm_number_widgets.get(item_id)
-            if not bounds:
+            if not _tree_row_is_fully_visible(
+                bounds,
+                self.crm_tree.winfo_height(),
+            ):
                 if widgets:
                     widgets[0].place_forget()
                 continue
@@ -3780,7 +4105,10 @@ class BugStatisticsApp(tk.Tk):
         for item_id in self.detail_tree.get_children():
             bounds = self.detail_tree.bbox(item_id, "id")
             widgets = self.detail_number_widgets.get(item_id)
-            if not bounds:
+            if not _tree_row_is_fully_visible(
+                bounds,
+                self.detail_tree.winfo_height(),
+            ):
                 if widgets:
                     widgets[0].place_forget()
                 continue

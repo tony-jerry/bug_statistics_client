@@ -628,9 +628,15 @@ def calculate_server_workload_hours(record: dict[str, Any]) -> float:
     return ceil((working_hours - 1e-12) * 100) / 100
 
 
+def _stable_percentage_bucket(allocation_key: str) -> int:
+    """Map a stable task key into a repeatable percentage bucket."""
+    return crc32(_text(allocation_key).casefold().encode("utf-8")) % 100
+
+
 def allocate_ui_workload(
     total_hours: float,
     task_name: str = "",
+    allocation_key: str = "",
 ) -> dict[str, Any]:
     """按前端历史比例和工作描述生成总量精确的字段组合。"""
 
@@ -737,23 +743,40 @@ def allocate_ui_workload(
     elif mentions_mature_interface:
         weights.update(controls=0.08, mature=0.30, new=0.08, testing=0.18)
 
-    # 预研仅在描述明确时分配主体工时；普通任务的 pre 字段只承接 <0.5h 尾差。
-    if is_pre_research and remaining > minimum_test_hours:
+    ui_key = allocation_key or f"{task_name}|{total_hours:.2f}"
+    meets_research_threshold = total_hours >= 16.0
+    probabilistic_research = (
+        meets_research_threshold
+        and _stable_percentage_bucket(f"{ui_key}|pre-research") < 50
+    )
+    # 2 天是预研的硬门槛：低于 16h 时，即使描述命中预研关键词也不分配。
+    # 达到门槛的普通任务稳定地取约 50%；明确的预研任务必定分配。
+    # 预研字段最多 4h，并预留至少 0.5h 自测。
+    if (
+        meets_research_threshold
+        and (is_pre_research or probabilistic_research)
+        and remaining > minimum_test_hours
+    ):
+        target_research_hours = (
+            min(round(total_hours * 0.25 * 2) / 2, 4.0)
+            if is_pre_research
+            else 4.0
+        )
         research_hours = min(
-            round(total_hours * 0.25 * 2) / 2,
+            target_research_hours,
             remaining - minimum_test_hours,
+            4.0,
         )
         values["preResearchWorkLoad"] = max(round(research_hours, 2), 0.0)
         remaining = round(remaining - values["preResearchWorkLoad"], 2)
 
     half_hour_units = max(int((remaining + 1e-9) / 0.5), 0)
     tail_hours = round(remaining - half_hour_units * 0.5, 2)
-    values["preResearchWorkLoad"] = round(
-        values["preResearchWorkLoad"] + tail_hours,
-        2,
-    )
+    # 小于 0.5h 的尾数属于自测，不能为了凑总工时写进预研字段。
+    testing_tail_hours = tail_hours
     core_hours = half_hour_units * 0.5
     if half_hour_units == 0:
+        values["selfTestingCount"] = round(testing_tail_hours / 0.5, 2)
         return values
 
     weight_total = sum(weights.values())
@@ -820,12 +843,17 @@ def allocate_ui_workload(
 
     if best is not None:
         values.update(best[1])
+    if testing_tail_hours:
+        values["selfTestingCount"] = round(
+            values["selfTestingCount"] + testing_tail_hours / 0.5,
+            2,
+        )
 
     calculated_hours = calculate_workload_hours(values)
     rounding_delta = round(total_hours - calculated_hours, 2)
     if abs(rounding_delta) > 0.001:
-        values["preResearchWorkLoad"] = round(
-            values["preResearchWorkLoad"] + rounding_delta,
+        values["selfTestingCount"] = round(
+            values["selfTestingCount"] + rounding_delta / 0.5,
             2,
         )
     return values
@@ -834,8 +862,9 @@ def allocate_ui_workload(
 def allocate_server_workload(
     total_hours: float,
     task_name: str = "",
+    allocation_key: str = "",
 ) -> dict[str, Any]:
-    """按后端真实公式和历史字段比例生成可解释、总量精确的字段组合。"""
+    """按后端高频字段生成可解释、优先与目标总量精确匹配的字段组合。"""
 
     total_hours = max(round(float(total_hours), 2), 0.0)
     normalized_name = _text(task_name).casefold()
@@ -845,7 +874,7 @@ def allocate_server_workload(
 
     method_type = (
         "业务封装"
-        if contains_any(("业务封装", "接口封装", "适配", "透传", "转发", "代理"))
+        if contains_any(("业务封装", "接口封装", "透传", "转发", "代理"))
         else "全新开发"
     )
     values: dict[str, Any] = {
@@ -866,56 +895,71 @@ def allocate_server_workload(
         "needHighPerformance": False,
     }
 
-    # 只有描述中存在明确语义时才启用附加项，并且不让附加项超过总工时。
-    optional_features: list[tuple[str, float]] = []
-    if contains_any(("不成熟组件", "组件调试", "组件联调")):
-        optional_features.append(("isImmatureComponentDebug", 4.0))
-    if contains_any(("数据准备", "准备数据", "初始化数据", "测试数据", "数据迁移")):
-        optional_features.append(("isNeedPrepareData", 4.0))
-    if method_type == "全新开发" and contains_any(
+    # 后端录入只主动填写高频字段，需求分析保持为 0。
+    uses_database = contains_any(
         ("数据库", "数据表", "表结构", "建表", "表脚本", "sql", "持久化", "dao")
-    ):
-        optional_features.append(("isDBOperation", 4.0))
+    )
+    adapts_database = contains_any(
+        (
+            "适配数据库",
+            "数据库适配",
+            "兼容数据库",
+            "数据库兼容",
+            "多数据库",
+            "多库适配",
+            "国产数据库",
+        )
+    )
+    database_key = allocation_key or f"{task_name}|{total_hours:.2f}"
+    # 明确的数据库任务必选；其余全新开发任务稳定地取 40% 分桶。
+    # 以任务内容作为种子，因此重复预览不会随机改变已分配字段。
+    probabilistic_database = (
+        method_type == "全新开发"
+        and total_hours >= 4.0
+        and _stable_percentage_bucket(database_key) < 40
+    )
+    if method_type == "全新开发" and (uses_database or probabilistic_database):
+        values["isDBOperation"] = True
+    # 在已勾选数据库的记录中稳定地取 80% 填写适配数量；描述明确包含
+    # 数据库适配/兼容的任务则必填。历史记录中 4 最常见，默认填 4。
+    fills_database_adapter = (
+        values["isDBOperation"]
+        and _stable_percentage_bucket(f"{database_key}|adapter") < 80
+    )
+    if values["isDBOperation"] and (adapts_database or fills_database_adapter):
+        values["dbAdapteNumer"] = 4.0
     ui_debug_hours = 2.0 if method_type == "全新开发" else 1.0
-    if contains_any(("前端联调", "接口联调", "前后端联调", "对接前端")):
-        optional_features.append(("isNeedUiDebug", ui_debug_hours))
-
-    semantic_hours = 0.0
-    for field_name, contribution in optional_features:
-        if semantic_hours + contribution <= total_hours + 1e-9:
-            values[field_name] = True
-            semantic_hours += contribution
+    semantic_hours = calculate_server_workload_hours(values)
+    # 前端联调是后端记录的高频项，默认勾选；仅当总工时连该项本身都
+    # 无法容纳时保持未勾选，避免生成的计算工时超过 Excel 工时。
+    if semantic_hours + ui_debug_hours <= total_hours + 1e-9:
+        values["isNeedUiDebug"] = True
+        semantic_hours = calculate_server_workload_hours(values)
 
     remaining = max(round(total_hours - semantic_hours, 2), 0.0)
-    requirement_values = (0.0, 2.0, 4.0, 6.0, 8.0)
     complexity_values = (0.0, 1.0, 2.0, 4.0, 8.0, 16.0)
-    # 来自当前版本 559 条后端记录的核心字段贡献比例：约 19% / 45% / 36%。
+    # 原历史比例为需求分析 19% / 代码复杂度 45% / 单元测试 36%。
+    # 需求分析不再自动填写后，将其余两项归一化为约 56% / 44%。
     targets = {
-        "requirements": remaining * 0.19,
-        "complexity": remaining * 0.45,
-        "unit_tests": remaining * 0.36,
+        "complexity": remaining * (45 / 81),
+        "unit_tests": remaining * (36 / 81),
     }
     unit_factor = 1.0 if method_type == "全新开发" else 0.5
     scale = max(remaining, 1.0)
-    candidates: list[tuple[float, float, float, float]] = []
-    for requirement_hours in requirement_values:
-        for complexity_hours in complexity_values:
-            unit_hours = round(remaining - requirement_hours - complexity_hours, 2)
-            if unit_hours < -1e-9:
-                continue
-            unit_scenes = max(unit_hours, 0.0) / unit_factor
-            score = (
-                ((requirement_hours - targets["requirements"]) / scale) ** 2
-                + ((complexity_hours - targets["complexity"]) / scale) ** 2
-                + ((unit_hours - targets["unit_tests"]) / scale) ** 2
-                + abs(unit_scenes - round(unit_scenes)) * 0.02
-            )
-            candidates.append(
-                (score, requirement_hours, complexity_hours, unit_scenes)
-            )
+    candidates: list[tuple[float, float, float]] = []
+    for complexity_hours in complexity_values:
+        unit_hours = round(remaining - complexity_hours, 2)
+        if unit_hours < -1e-9:
+            continue
+        unit_scenes = max(unit_hours, 0.0) / unit_factor
+        score = (
+            ((complexity_hours - targets["complexity"]) / scale) ** 2
+            + ((unit_hours - targets["unit_tests"]) / scale) ** 2
+            + abs(unit_scenes - round(unit_scenes)) * 0.02
+        )
+        candidates.append((score, complexity_hours, unit_scenes))
     if candidates:
-        _score, requirement_hours, complexity_hours, unit_scenes = min(candidates)
-        values["reqAnalyzeWorkLoad"] = requirement_hours
+        _score, complexity_hours, unit_scenes = min(candidates)
         values["codeComplexity"] = complexity_hours
         values["unitTestNumber"] = round(unit_scenes, 2)
     return values
@@ -1008,11 +1052,13 @@ def build_workload_preview(
             allocation = allocate_server_workload(
                 item.requested_days * 8,
                 item.task_name,
+                f"{item.require_no}|{item.task_name}",
             )
         else:
             allocation = allocate_ui_workload(
                 item.requested_days * 8,
                 item.task_name,
+                f"{item.require_no}|{item.task_name}",
             )
         record: dict[str, Any] = {
             "rowId": uuid4().hex,
@@ -1036,7 +1082,8 @@ def build_workload_preview(
         requested_hours = round(item.requested_days * 8, 2)
         if abs(computed_hours - requested_hours) > 0.01:
             warnings.append(
-                f"按原规则计算为 {computed_hours:g}h，Excel 为 {requested_hours:g}h"
+                f"按原规则计算为 {computed_hours / 8:g}天，"
+                f"Excel 为 {item.requested_days:g}天"
             )
         fingerprint = task_fingerprint(record)
         if fingerprint in existing or fingerprint in pending:

@@ -92,6 +92,41 @@ def test_analytics() -> None:
     assert rows[0]["total"] == 2
 
 
+def test_popup_position_stays_above_bottom_taskbar() -> None:
+    from app import _fit_popup_position
+
+    work_area = (0, 0, 1920, 1032)
+    assert _fit_popup_position(
+        980,
+        760,
+        790,
+        350,
+        300,
+        work_area,
+    ) == (980, 460)
+
+
+def test_popup_position_uses_space_below_when_available() -> None:
+    from app import _fit_popup_position
+
+    assert _fit_popup_position(
+        100,
+        100,
+        130,
+        350,
+        300,
+        (0, 0, 1920, 1032),
+    ) == (100, 130)
+
+
+def test_embedded_tree_widgets_ignore_partial_rows() -> None:
+    from app import _tree_row_is_fully_visible
+
+    assert _tree_row_is_fully_visible((0, 30, 180, 32), 100)
+    assert not _tree_row_is_fully_visible((0, 86, 180, 32), 100)
+    assert not _tree_row_is_fully_visible((), 100)
+
+
 def test_crm_helpers() -> None:
     assert (
         encrypt_crm_password("example-password")
@@ -379,22 +414,32 @@ def test_workload_import() -> None:
         app.after_cancel(app._worker_poll_after_id)
         app.destroy()
 
-    allocation = allocate_ui_workload(16, "普通前端任务")
+    allocation = allocate_ui_workload(16, "普通前端任务", "no-research")
     assert allocation["reqAnalyzeWorkLoad"] == 4
     assert allocation["keyControlsCount"] == 3
     assert allocation["selfTestingCount"] == 7
     assert calculate_workload_hours(allocation) == 16
 
     for hours in (0.1, 0.5, 1, 2, 4, 8, 12, 16, 19.2, 24, 32):
-        generated = allocate_ui_workload(hours, "普通前端任务")
+        generated = allocate_ui_workload(
+            hours,
+            "普通前端任务",
+            "no-research",
+        )
         assert calculate_workload_hours(generated) == hours
         assert generated["reqAnalyzeWorkLoad"] in {0, 2, 4, 6, 8}
         assert generated["preResearchWorkLoad"] >= 0
         assert generated["selfTestingCount"] >= 0
+        if hours < 16:
+            assert generated["preResearchWorkLoad"] == 0
 
-    fractional_ui = allocate_ui_workload(19.2, "普通前端任务")
-    assert fractional_ui["preResearchWorkLoad"] == 0.2
+    fractional_ui = allocate_ui_workload(19.2, "普通前端任务", "no-research")
+    assert fractional_ui["preResearchWorkLoad"] == 0
     assert calculate_workload_hours(fractional_ui) == 19.2
+
+    below_threshold_ui = allocate_ui_workload(8.8, "普通前端任务", "research")
+    assert below_threshold_ui["preResearchWorkLoad"] == 0
+    assert calculate_workload_hours(below_threshold_ui) == 8.8
 
     control_ui = allocate_ui_workload(12, "页面表格和树控件开发")
     assert control_ui["keyControlsCount"] == 3
@@ -421,30 +466,89 @@ def test_workload_import() -> None:
     assert calculate_workload_hours(immature_ui) == 12
 
     research_ui = allocate_ui_workload(8, "技术预研和可行性验证")
-    assert research_ui["preResearchWorkLoad"] >= 2
+    assert research_ui["preResearchWorkLoad"] == 0
     assert calculate_workload_hours(research_ui) == 8
+
+    research_probability_records = [
+        allocate_ui_workload(16, "普通前端任务", f"ui-task-{index}")
+        for index in range(1000)
+    ]
+    research_count = sum(
+        record["preResearchWorkLoad"] > 0
+        for record in research_probability_records
+    )
+    assert 450 <= research_count <= 550
+    assert all(
+        0 <= record["preResearchWorkLoad"] <= 4
+        for record in research_probability_records
+    )
+    assert all(
+        calculate_workload_hours(record) == 16
+        for record in research_probability_records
+    )
+    fractional_research = allocate_ui_workload(
+        19.2,
+        "普通前端任务",
+        "research",
+    )
+    assert fractional_research["preResearchWorkLoad"] == 4
+    assert calculate_workload_hours(fractional_research) == 19.2
+    capped_research = allocate_ui_workload(32, "技术预研", "research")
+    assert capped_research["preResearchWorkLoad"] == 4
+    assert calculate_workload_hours(capped_research) == 32
 
     assert allocation["selfTestingCount"] * 0.5 < 16 * 0.3
 
     server_allocation = allocate_server_workload(12)
     assert server_allocation["methodType"] == "全新开发"
-    assert server_allocation["reqAnalyzeWorkLoad"] == 2
+    assert server_allocation["reqAnalyzeWorkLoad"] == 0
+    assert server_allocation["isNeedUiDebug"] is True
     assert server_allocation["codeComplexity"] == 4
     assert server_allocation["unitTestNumber"] == 6
     assert calculate_workload_hours(server_allocation) == 12
-    for hours in (1, 2, 4, 8, 12, 16, 24, 32):
-        generated = allocate_server_workload(hours, "普通后端任务")
+    for hours in (0.1, 1, 2, 4, 8, 12, 16, 19.2, 24, 32):
+        generated = allocate_server_workload(
+            hours,
+            "普通后端任务",
+            "no-db-0",
+        )
         assert calculate_workload_hours(generated) == hours
-        assert generated["reqAnalyzeWorkLoad"] in {0, 2, 4, 6, 8}
+        assert generated["reqAnalyzeWorkLoad"] == 0
         assert generated["codeComplexity"] in {0, 1, 2, 4, 8, 16}
+        assert generated["isNeedUiDebug"] is (hours >= 2)
+
+    probability_records = [
+        allocate_server_workload(8, "普通后端任务", f"task-{index}")
+        for index in range(1000)
+    ]
+    database_count = sum(record["isDBOperation"] for record in probability_records)
+    database_adapter_count = sum(
+        record["dbAdapteNumer"] > 0
+        for record in probability_records
+        if record["isDBOperation"]
+    )
+    assert 350 <= database_count <= 450
+    assert database_count * 0.75 <= database_adapter_count <= database_count * 0.85
+    assert all(calculate_workload_hours(record) == 8 for record in probability_records)
+    assert allocate_server_workload(8, "普通后端任务", "stable-task") == (
+        allocate_server_workload(8, "普通后端任务", "stable-task")
+    )
 
     encapsulation = allocate_server_workload(8, "接口封装")
     assert encapsulation["methodType"] == "业务封装"
-    assert encapsulation["unitTestNumber"] == 4
+    assert encapsulation["reqAnalyzeWorkLoad"] == 0
+    assert encapsulation["isNeedUiDebug"] is True
+    assert encapsulation["unitTestNumber"] == 6
     assert calculate_workload_hours(encapsulation) == 8
-    database_task = allocate_server_workload(12, "数据库查询")
+    database_task = allocate_server_workload(12, "数据库查询", "adapter-yes")
     assert database_task["isDBOperation"] is True
+    assert database_task["dbAdapteNumer"] == 0
+    assert database_task["reqAnalyzeWorkLoad"] == 0
     assert calculate_workload_hours(database_task) == 12
+    database_adaptation = allocate_server_workload(12, "适配数据库并兼容多数据库")
+    assert database_adaptation["isDBOperation"] is True
+    assert database_adaptation["dbAdapteNumer"] == 4
+    assert calculate_workload_hours(database_adaptation) == 12
     ui_debug_task = allocate_server_workload(12, "前端联调")
     assert ui_debug_task["isNeedUiDebug"] is True
     assert calculate_workload_hours(ui_debug_task) == 12
@@ -678,8 +782,23 @@ def test_workload_import() -> None:
         }
         app._render_workload_preview()
         app.update_idletasks()
-        assert app.workload_tree.heading("requested_hours", "text") == "Excel 工时（小时）"
-        assert app.workload_tree.heading("computed_hours", "text") == "计算工时（小时）"
+        assert app.workload_tree.heading("requested_hours", "text") == "Excel 工时（天）"
+        assert app.workload_tree.heading("computed_hours", "text") == "计算工时（天）"
+        assert app.workload_tree.set("2", "requested_hours") == "2"
+        assert app.workload_tree.set("2", "computed_hours") == "2"
+        initial_theme = app.theme_name
+        initial_background = app.cget("background")
+        with patch.object(app, "_save_settings"):
+            app._toggle_theme()
+            assert app.theme_name != initial_theme
+            assert app.cget("background") != initial_background
+            assert app.settings["theme"] == app.theme_name
+            assert (
+                "深色" if app.theme_name == "light" else "浅色"
+            ) in app.theme_button.cget("text")
+            app._toggle_theme()
+        assert app.theme_name == initial_theme
+        assert app.cget("background") == initial_background
         assert "工作量录入" in app.workload_nav_button.cget("text")
         assert app.workload_tree.set("2", "selected") == "☑"
         assert app.workload_tree.set("3", "selected") == "☐"
@@ -688,13 +807,19 @@ def test_workload_import() -> None:
         checkbox, status_label, delete_button = app.workload_row_widgets["2"]
         assert checkbox.cget("cursor") == "hand2"
         assert "15" in str(checkbox.cget("font"))
-        assert status_label.cget("foreground") == "#45E0B2"
-        assert delete_button.cget("foreground") == "#FF7F96"
+        assert status_label.cget("foreground") == (
+            "#047857" if app.theme_name == "light" else "#45E0B2"
+        )
+        assert delete_button.cget("foreground") == (
+            "#BE123C" if app.theme_name == "light" else "#FF7F96"
+        )
         assert delete_button.cget("cursor") == "hand2"
         error_checkbox, error_status, _error_delete = app.workload_row_widgets["3"]
         assert str(error_checkbox.cget("state")) == "disabled"
         assert error_checkbox.cget("cursor") == "no"
-        assert error_status.cget("foreground") == "#FF7F96"
+        assert error_status.cget("foreground") == (
+            "#BE123C" if app.theme_name == "light" else "#FF7F96"
+        )
         assert app.workload_tree.heading("selected", "text") == ""
         assert app.workload_select_all_button.cget("text") == "☑"
         assert (
@@ -795,7 +920,7 @@ def test_workload_import() -> None:
         app._apply_workload_edit(added_row, "task_name", "表格内新增测试")
         app._apply_workload_edit(added_row, "plan_start", "2026-08-24")
         app._apply_workload_edit(added_row, "plan_finish", "2026-08-25")
-        app._apply_workload_edit(added_row, "requested_hours", "8")
+        app._apply_workload_edit(added_row, "requested_hours", "1")
         added_preview_row = next(
             row
             for row in app.workload_preview.rows
@@ -821,9 +946,9 @@ def test_workload_import() -> None:
         assert all(item.excel_row != added_row for item in app.workload_items)
 
         app.workload_editor = ttk.Entry(app)
-        app._commit_workload_edit(2, "requested_hours", "8")
+        app._commit_workload_edit(2, "requested_hours", "1")
         assert app.workload_items[0].requested_days == 1
-        assert app.workload_tree.set("2", "requested_hours") == "8"
+        assert app.workload_tree.set("2", "requested_hours") == "1"
         assert app.workload_tree.set("2", "selected") == "☑"
 
         app.workload_selected_rows.clear()
@@ -878,9 +1003,10 @@ def test_workload_import() -> None:
         server_record = server_preview.submittable_rows[0].record
         assert server_record is not None
         assert server_record["methodType"] == "全新开发"
-        assert server_record["reqAnalyzeWorkLoad"] == 2
+        assert server_record["reqAnalyzeWorkLoad"] == 0
         assert server_record["codeComplexity"] == 8
         assert server_record["unitTestNumber"] == 6
+        assert server_record["isNeedUiDebug"] is True
         assert server_preview.computed_hours == 16
 
         duplicate_record = dict(preview.submittable_rows[0].record)
@@ -906,6 +1032,9 @@ def test_workload_import() -> None:
 
 if __name__ == "__main__":
     test_analytics()
+    test_popup_position_stays_above_bottom_taskbar()
+    test_popup_position_uses_space_below_when_available()
+    test_embedded_tree_widgets_ignore_partial_rows()
     test_crm_helpers()
     test_credential_store()
     test_all_detail_fields()
